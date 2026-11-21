@@ -20,7 +20,8 @@ tables, and a proper header and footer. Files never leave your machine.
 
 - **Layout-faithful conversion** of text PDFs: fonts, tables, images and spacing.
 - **Built-in OCR** for scanned PDFs (PP-OCRv5 via RapidOCR). It straightens pages, recognizes
-  the text, rebuilds tables from their ruling lines and recovers bullet points. Supported
+  the text, rebuilds tables (very light borders, coloured header rows and banners
+  included) and recovers bullet points. Supported
   languages: English, other Latin-script languages, and Arabic *(1.1)*.
 - **Arabic and right-to-left text** *(1.1)*, from scans and from digital PDFs. Paragraphs come out
   right to left in Word, in correct reading order, with numbers and Latin words such as
@@ -177,9 +178,8 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
   get right-to-left paragraphs, but they're less tested.
 - On Arabic scans, font sizes are estimated from line width and height, so a heading only
   slightly larger than body text can be missed.
-- OCR rebuilds tables from their visible ruling lines. Very light borders (common in PDFs
-  printed from a browser) can vanish in a scan, and those tables then come out as loose
-  text.
+- OCR rebuilds tables from their ruling lines (very light ones included) and coloured
+  header rows. Tables drawn with no lines or fills at all still come out as loose text.
 - Layout fidelity on complex digital PDFs depends on pdf2docx, and very dense layouts may
   need touch-ups.
 

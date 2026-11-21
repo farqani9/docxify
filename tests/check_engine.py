@@ -170,6 +170,22 @@ with tempfile.TemporaryDirectory() as tmp:
         ok &= check(not re.search(r"(?m)^\.\d", text), "list numbers in reading order (no \".2\")")
         ok &= check(bool(re.search(r"(?m)^Contact: info@example\.com\s*$", text)), "English line is its own paragraph")
 
+    # ------------------------------------------- scanned designed table (light borders)
+    print("scanned table with light borders + OCR")
+    lt = Path(tmp) / "light.docx"
+    engine.convert(FIX / "light_table_scanned.pdf", lt, ocr=True)
+    d = docx.Document(str(lt))
+    grids = [t for t in d.tables if len(t.rows) > 2]
+    cells = [[c.text.strip() for c in r.cells] for r in grids[0].rows] if grids else []
+    ok &= check(cells == F.LIGHT_TABLE, "table with very light borders rebuilt cell for cell")
+    head_fill = {s.get(qn("w:fill")) for s in grids[0].rows[0]._tr.iter(qn("w:shd"))} - {None, "auto"} if grids else set()
+    ok &= check(bool(head_fill), "coloured header row keeps its shading")
+    banner = next((t for t in d.tables if len(t.rows) == 1 and t.rows[0].cells[0].text.strip() == "Implementation method"), None)
+    shaded = banner is not None and bool({s.get(qn("w:fill")) for s in banner._tbl.iter(qn("w:shd"))} - {None, "auto"})
+    white = banner is not None and any(r.font.color.rgb is not None and str(r.font.color.rgb) == "FFFFFF"
+                                       for p in banner.rows[0].cells[0].paragraphs for r in p.runs)
+    ok &= check(shaded and white, "dark banner keeps its fill and white text")
+
     # ------------------------------------------- clean-up rules on an English page
     print("clean-up rules (English)")
     gen = Path(tmp) / "generic.docx"

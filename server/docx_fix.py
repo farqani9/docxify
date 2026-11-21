@@ -208,6 +208,35 @@ def split_size_changes(doc) -> int:
     return made
 
 
+def readable_light_text(doc) -> int:
+    """White (or near-white) text with no shading behind it, in its cell, paragraph or
+    run, would be invisible on the page: make it black."""
+    fixed = 0
+
+    def shaded(el) -> bool:
+        shd = el.find(W + "shd") if el is not None else None
+        return shd is not None and (shd.get(W + "fill") or "auto").lower() not in ("auto", "ffffff")
+
+    for r in doc.element.body.iter(W + "r"):
+        rpr = r.find(W + "rPr")
+        col = rpr.find(W + "color") if rpr is not None else None
+        val = (col.get(W + "val") or "") if col is not None else ""
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", val) or min(int(val[i:i + 2], 16) for i in (0, 2, 4)) < 230:
+            continue
+        p = r.getparent()
+        while p is not None and p.tag != W + "p":
+            p = p.getparent()
+        tc = p.getparent() if p is not None else None
+        while tc is not None and tc.tag != W + "tc":
+            tc = tc.getparent() if tc.tag != W + "body" else None
+        if shaded(rpr) or (p is not None and shaded(p.find(W + "pPr"))) or \
+                (tc is not None and shaded(tc.find(W + "tcPr"))):
+            continue
+        col.set(W + "val", "000000")
+        fixed += 1
+    return fixed
+
+
 def trim_edge_breaks(doc) -> int:
     """A plain line break at the very start or end of a paragraph only adds an empty
     line (left over where items or lines were split apart). Page breaks stay."""
@@ -1178,7 +1207,7 @@ def _mark_rtl_runs(p) -> None:
 
 # ------------------------------------------------------------------ facade
 def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, body_rules=None,
-                placeholders: Optional[dict] = None) -> dict:
+                placeholders: Optional[dict] = None, ocr: bool = False) -> dict:
     doc = Document(str(path))
     stats = {"fonts_mapped": normalize_fonts(doc)}
     sanitize(doc)
@@ -1209,5 +1238,7 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
     # header/footer runs were rebuilt from the source text: no placeholders there
     stats.update(fix_rtl(doc))
     stats["edge_breaks_trimmed"] = trim_edge_breaks(doc)
+    if ocr:   # rebuilt pages: white text belongs on a fill; digital PDFs can put it on pictures
+        stats["light_text_fixed"] = readable_light_text(doc)
     doc.save(str(path))
     return stats

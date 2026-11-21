@@ -16,6 +16,9 @@
   arabic_pages_scanned.pdf : the same, scanned
 - generic.pdf : English page for clean-up rules: two same-size headings in a row and
                 a numbered list that continues at "3." after a note
+- light_table_scanned.pdf : a designed page as browsers print it (dark banner with
+                white text, a table with very light borders, a coloured header band
+                with white labels, zebra rows), scanned -> OCR must rebuild the table
 """
 from pathlib import Path
 
@@ -274,6 +277,32 @@ def make_generic(path):
     doc.save(path)
 
 
+LIGHT_TABLE = [["Phase", "Main activities", "Deliverable"],
+               ["Analysis", "Workshops and audience study", "Needs report"],
+               ["Design", "Scripts and storyboards", "Storyboards"],
+               ["Build", "Animation and voice recording", "Beta version"],
+               ["Pilot", "Field test in schools", "Final release"]]
+
+
+def make_light_table(path):
+    rows = "".join("<tr>" + "".join((f"<th>{c}</th>" if i == 0 else f"<td>{c}</td>") for c in row) + "</tr>"
+                   for i, row in enumerate(LIGHT_TABLE))
+    css = ("body { font-family: sans-serif; font-size: 11pt; color: #1d2b33; } "
+           ".banner { background: #17616f; color: #ffffff; font-weight: bold; font-size: 14pt; "
+           "padding: 6pt 10pt; margin: 0 0 10pt 0; } p { margin: 0 0 10pt 0; } "
+           "table { border-collapse: collapse; width: 100%; } "
+           "td { border: 1px solid #cfe2e7; padding: 6pt; } "
+           "th { background: #53b6ca; color: #ffffff; padding: 6pt; text-align: left; } "
+           "tr:nth-child(odd) td { background: #f5fbfc; }")
+    html = (f'<div class="banner">Implementation method</div>'
+            f"<p>Each phase ends with a deliverable that the ministry approves.</p>"
+            f"<table>{rows}</table>")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_htmlbox(pymupdf.Rect(50, 60, 545, 700), html, css=css)
+    doc.save(path)
+
+
 if __name__ == "__main__":
     make_digital(OUT / "digital.pdf")
     make_scanned(OUT / "digital.pdf", OUT / "scanned.pdf")
@@ -283,8 +312,11 @@ if __name__ == "__main__":
     make_arabic_pages(OUT / "arabic_pages.pdf")
     make_scanned(OUT / "arabic_pages.pdf", OUT / "arabic_pages_scanned.pdf", seed=3)
     make_generic(OUT / "generic.pdf")
+    make_light_table(OUT / "_light_table.pdf")
+    make_scanned(OUT / "_light_table.pdf", OUT / "light_table_scanned.pdf", seed=5)
+    (OUT / "_light_table.pdf").unlink()
     for name in ("digital.pdf", "scanned.pdf", "arabic_shaped.pdf", "arabic_scanned.pdf", "arabic_digital.pdf",
-                 "arabic_pages.pdf", "arabic_pages_scanned.pdf", "generic.pdf"):
+                 "arabic_pages.pdf", "arabic_pages_scanned.pdf", "generic.pdf", "light_table_scanned.pdf"):
         d = pymupdf.open(OUT / name)
         chars = sum(len(p.get_text().strip()) for p in d)
         print(f"{name}: {d.page_count} pages, {chars} extractable chars, "
