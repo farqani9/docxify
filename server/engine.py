@@ -50,6 +50,8 @@ OCR_LANGS = ("en", "latin", "ar")
 ARABIC_WIDTH_RATIO = 0.85    # shaped width / unshaped Noto Naskh width (calibrated)
 ARABIC_DET_EM = 1.53         # detector box height of an Arabic line, in em (calibrated)
 ARABIC_GROUP_ASPECT = 6.0    # widest word group (x line height) recognised in one go
+REVIEW_SCORE = 0.85          # OCR lines read with less confidence are marked for proofreading
+REVIEW_WORD_SCORE = 0.75     # ... and so are Arabic word pieces read with less confidence
 is_rtl = docx_fix.is_rtl
 
 
@@ -158,6 +160,7 @@ class OcrLine:
     rtl: bool = False         # right-to-left line (text kept in logical order)
     det: tuple = ()           # detector box in the deskewed image (px)
     light: bool = False       # light text on a dark fill (e.g. a coloured header band)
+    uncertain: list = field(default_factory=list)   # words read with low confidence
 
 
 @dataclass
@@ -686,7 +689,7 @@ def _visual_join(parts: list) -> str:
     from bidi.algorithm import get_display
 
     visual = []
-    for _x, text, ltr in sorted((p for p in parts if p[1]), key=lambda p: p[0]):
+    for _x, text, ltr, *_score in sorted((p for p in parts if p[1]), key=lambda p: p[0]):
         # logical -> visual flips only the right-to-left runs (digits keep their order)
         visual.append(text if ltr else get_display(text, base_dir="R"))
     return layout._logical_from_visual(" ".join(visual))
@@ -738,7 +741,7 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
                         read(off + sa_, off + sb_, depth + 1)
                     return
             use_en = token and se >= 0.6 and not arabic
-            parts.append((a, te if use_en else ta, use_en))
+            parts.append((a, te if use_en else ta, use_en, se if use_en else sa))
 
         for a, b, _fill in body:
             read(a, b, 0)
@@ -748,16 +751,22 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
         group: list = []
         for c in sorted(body, key=lambda c: -c[0]):
             if group and group[0][1] - c[0] > ARABIC_GROUP_ASPECT * h:
-                parts.append((group[-1][0], _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")[0], False))
+                ta, sa = _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")
+                parts.append((group[-1][0], ta, False, sa))
                 group = []
             group.append(c)
         if group:
-            parts.append((group[-1][0], _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")[0], False))
+            ta, sa = _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")
+            parts.append((group[-1][0], ta, False, sa))
     if parts:
         joined = _rtl_join(parts) if not any(p[2] for p in parts) else _visual_join(parts)
         # never lose Arabic content to the cutting: keep the whole-line reading then
         if len(_ARABIC_LETTER.findall(joined)) >= 0.85 * len(_ARABIC_LETTER.findall(text)):
             text = joined
+            kept = [p for p in parts if p[1].strip()]
+            if kept:   # confidence of what was kept, not of the replaced whole-line reading
+                ln.score = sum(p[3] * len(p[1]) for p in kept) / max(1, sum(len(p[1]) for p in kept))
+                ln.uncertain = [p[1].strip() for p in kept if p[3] < REVIEW_WORD_SCORE]
     text = _fix_marker(text)
     if chunks and not bullet and (chunks[-1][1] - chunks[-1][0]) <= 1.2 * h:
         # a list number ("٢.", "3)") read alone: inside a word group it can get lost
@@ -936,8 +945,15 @@ def _assign_sizes(lines: list[OcrLine], pt_per_px: float) -> None:
 PLACEHOLDER = docx_fix.PLACEHOLDER
 
 
+def _review_ink(ln: "OcrLine", ink: tuple) -> tuple:
+    """Text colour that carries a low-confidence mark through the layout converter:
+    almost the real colour, with the confidence (in %) in the blue channel."""
+    pct = max(0, min(99, int(ln.score * 100))) / 255
+    return (1 / 255, 0, pct) if ink == (0, 0, 0) else (254 / 255, 1, pct)
+
+
 def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], lang: str,
-                  progress: Optional[Progress] = None) -> tuple[dict, dict]:
+                  progress: Optional[Progress] = None, review: bool = False) -> tuple[dict, dict]:
     """Write a copy of ``src`` where every scanned page is replaced by a text page.
 
     Right-to-left lines are written as placeholder tokens stretched over their box:
@@ -983,6 +999,9 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
                 if ln.rtl:
                     token = layout.placeholder(len(placeholders))
                     placeholders[token] = {"text": ln.text, "size": ln.size, "bold": False}
+                    if review and (ln.score < REVIEW_SCORE or ln.uncertain):
+                        placeholders[token]["review"] = {"score": round(ln.score, 2),
+                                                         "words": [] if ln.score < REVIEW_SCORE else ln.uncertain}
                     stats["ocr_bullets"] += ln.text.startswith("\u2022 ")
                     text, size = layout.fit_token(token, (ln.x1 - ln.x0) * sx, ln.size)
                     newp.insert_text((ln.x0 * sx, bottom - 0.25 * ln.size), text,
@@ -993,6 +1012,8 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
                     newp.insert_text((ln.bullet_x * sx, baseline), "•", fontname="helv",
                                      fontsize=ln.size)
                     stats["ocr_bullets"] += 1
+                if review and ln.score < REVIEW_SCORE:
+                    ink = _review_ink(ln, ink)
                 newp.insert_text((ln.x0 * sx, baseline), ln.text, fontname="helv", fontsize=ln.size,
                                  color=ink)
             stats["ocr_pages"] += 1
@@ -1485,7 +1506,7 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
 
 # ---------------------------------------------------------------------- facade
 def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en",
-            progress: Optional[Progress] = None) -> dict:
+            progress: Optional[Progress] = None, review: bool = False) -> dict:
     """Convert ``src`` (PDF) to ``dst`` (DOCX). Returns conversion statistics."""
     t0 = time.time()
     if progress:
@@ -1502,7 +1523,7 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
         work = Path(src)
         if ocr and info.scanned_pages:
             work = Path(tmp) / "ocr.pdf"
-            ocr_stats, placeholders = build_ocr_pdf(src, work, info.scanned_pages, lang, progress)
+            ocr_stats, placeholders = build_ocr_pdf(src, work, info.scanned_pages, lang, progress, review=review)
             stats.update(ocr_stats)
             stats["ocr"] = True
 
@@ -1538,7 +1559,8 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
 
         _pdf_to_docx(body_pdf, dst, progress)
         try:
-            stats.update(docx_fix.postprocess(dst, bands, work, rules, placeholders, ocr=stats["ocr"]))
+            stats.update(docx_fix.postprocess(dst, bands, work, rules, placeholders, ocr=stats["ocr"],
+                                              review=review and stats["ocr"]))
         except Exception:
             log.exception("docx post-processing failed; keeping raw layout")
 

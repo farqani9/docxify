@@ -198,6 +198,28 @@ with tempfile.TemporaryDirectory() as tmp:
                     for t in F.PICTURE_TEXT), "text around the pictures still recognised")
     ok &= check(not re.search(r"STATION\s*N1|AQUA", text.upper()), "lettering inside pictures stays in the pictures")
 
+    # ------------------------------------------- proofreading marks
+    print("proofreading marks (ocr_review)")
+    def highlighted(path):
+        d = docx.Document(str(path))
+        hl = sum(1 for r in d.element.body.iter(qn("w:r")) if r.find(f"{qn('w:rPr')}/{qn('w:highlight')}") is not None)
+        markers = sum(1 for c in d.element.body.iter(qn("w:color")) if re.match(r"^(0100|FEFF)[0-9A-Fa-f]{2}$", c.get(qn("w:val")) or ""))
+        return hl, markers
+    rv = Path(tmp) / "review.docx"
+    engine.convert(FIX / "scanned.pdf", rv, ocr=True)
+    ok &= check(highlighted(rv) == (0, 0), "off by default: nothing highlighted")
+    saved = engine.REVIEW_SCORE
+    engine.REVIEW_SCORE = 1.01                  # every line counts as uncertain
+    try:
+        rstats = engine.convert(FIX / "scanned.pdf", rv, ocr=True, review=True)
+    finally:
+        engine.REVIEW_SCORE = saved
+    hl, markers = highlighted(rv)
+    ok &= check(hl >= 30 and rstats.get("ocr_review_marks", 0) >= 30, f"uncertain lines highlighted ({hl})")
+    ok &= check(markers == 0, "marker colours replaced by the real text colour")
+    rstats = engine.convert(FIX / "arabic_scanned.pdf", rv, ocr=True, lang="ar", review=True)
+    ok &= check("ocr_review_marks" in rstats, f"Arabic word marks reported ({rstats.get('ocr_review_marks')})")
+
     # ------------------------------------------- clean-up rules on an English page
     print("clean-up rules (English)")
     gen = Path(tmp) / "generic.docx"

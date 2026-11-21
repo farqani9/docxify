@@ -1048,6 +1048,86 @@ def break_rtl_lines(doc, mapping: dict) -> int:
     return made
 
 
+_REVIEW_INK = re.compile(r"^(0100|FEFF)([0-9A-Fa-f]{2})$")
+
+
+def _highlight(r) -> None:
+    rpr = r.find(W + "rPr")
+    if rpr is None:
+        rpr = OxmlElement("w:rPr")
+        r.insert(0, rpr)
+    _ordered_child(rpr, "highlight").set(W + "val", "yellow")
+
+
+def _highlight_words(r, words: list) -> int:
+    """Split run ``r`` so that each of ``words`` (first occurrence) is its own highlighted run."""
+    t = r.find(W + "t")
+    text = (t.text or "") if t is not None else ""
+    spans, pos = [], 0
+    for wd in words:
+        k = text.find(wd, pos)
+        if k < 0:
+            k = text.find(wd)
+        if k >= 0 and wd:
+            spans.append((k, k + len(wd)))
+            pos = k + len(wd)
+    if not spans:
+        return 0
+    spans = sorted(set(spans))
+    pieces, cur = [], 0
+    for a, b in spans:
+        if a < cur:
+            continue
+        if a > cur:
+            pieces.append((text[cur:a], False))
+        pieces.append((text[a:b], True))
+        cur = b
+    if cur < len(text):
+        pieces.append((text[cur:], False))
+    rpr = r.find(W + "rPr")
+    for piece, marked in pieces:
+        nr = OxmlElement("w:r")
+        if rpr is not None:
+            nr.append(copy.deepcopy(rpr))
+        nt = OxmlElement("w:t")
+        nt.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        nt.text = piece
+        nr.append(nt)
+        if marked:
+            _highlight(nr)
+        r.addprevious(nr)
+    r.getparent().remove(r)
+    return sum(1 for _p, m in pieces if m)
+
+
+def mark_review(doc, mapping: dict) -> int:
+    """Highlight text the OCR read with low confidence. Left-to-right lines come
+    with a marker colour (the confidence in the blue channel), which is replaced by
+    the real colour; right-to-left lines were flagged in their placeholder record."""
+    marks = 0
+    for r in list(doc.element.body.iter(W + "r")):
+        col = r.find(f"{W}rPr/{W}color")
+        m = _REVIEW_INK.match((col.get(W + "val") or "") if col is not None else "")
+        if not m:
+            continue
+        col.set(W + "val", "000000" if m.group(1) == "0100" else "FFFFFF")
+        if _run_text(r).strip():
+            _highlight(r)
+            marks += 1
+    for r in list(doc.element.body.iter(W + "r")):
+        info = r.attrib.pop("{urn:docxify}review", None)
+        if info is None:
+            continue
+        e = mapping.get(info) or {}
+        words = (e.get("review") or {}).get("words") or []
+        if words:
+            marks += _highlight_words(r, words)
+        else:
+            _highlight(r)
+            marks += 1
+    return marks
+
+
 def substitute_placeholders(doc, mapping: dict) -> int:
     """Swap placeholder tokens for the logical-order text, with the intended font
     size and weight (the token itself was sized only to cover the right width)."""
@@ -1088,6 +1168,8 @@ def substitute_placeholders(doc, mapping: dict) -> int:
                 run = t.getparent()
                 if run is not None and run.tag == W + "r":
                     style_run(run, entry(toks[0]))
+                    if len(toks) == 1 and entry(toks[0]).get("review"):
+                        run.set("{urn:docxify}review", layout.placeholder_key(toks[0]))
                 n += 1
         for p in root.iter(W + "p"):   # a token split across runs
             ts = list(p.iter(W + "t"))
@@ -1207,7 +1289,7 @@ def _mark_rtl_runs(p) -> None:
 
 # ------------------------------------------------------------------ facade
 def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, body_rules=None,
-                placeholders: Optional[dict] = None, ocr: bool = False) -> dict:
+                placeholders: Optional[dict] = None, ocr: bool = False, review: bool = False) -> dict:
     doc = Document(str(path))
     stats = {"fonts_mapped": normalize_fonts(doc)}
     sanitize(doc)
@@ -1216,6 +1298,8 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
         stats["rtl_line_breaks"] = break_rtl_lines(doc, placeholders)
     stats["rtl_lines_restored"] = substitute_placeholders(doc, placeholders or {})
     normalize_arabic_forms(doc)
+    if review:
+        stats["ocr_review_marks"] = mark_review(doc, placeholders or {})
     stats.update(relax_heights(doc))
     stats["table_grids_fixed"] = fix_table_grids(doc)
     boundaries = merge_sections(doc)

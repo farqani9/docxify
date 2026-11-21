@@ -14,6 +14,7 @@
     files: [],            // {uid, file, name, size, status, progress, server_filename, pages, scanned, thumbnail, el}
     ocr: false,
     lang: 'en',
+    review: false,
     queue: Promise.resolve(),
   };
 
@@ -222,12 +223,14 @@
       ? 'This PDF looks scanned. OCR is recommended.'
       : `${scanned.length} of ${ready.length} PDFs look scanned. OCR is recommended.`;
     $('lang-field').hidden = !state.ocr;
+    $('review-field').hidden = !state.ocr;
     document.querySelector(`input[name=ocr][value="${state.ocr ? 1 : 0}"]`).checked = true;
   }
 
   document.querySelectorAll('input[name=ocr]').forEach((r) =>
     r.addEventListener('change', () => { state.ocr = r.value === '1' && r.checked; syncPanel(); }));
   $('lang').addEventListener('change', (e) => { state.lang = e.target.value; });
+  $('review').addEventListener('change', (e) => { state.review = e.target.checked; });
 
   // ------------------------------------------------------------------ OCR prompt
   function askOcr() {
@@ -293,6 +296,7 @@
     form.append('convert_to', 'docx');
     form.append('ocr', state.ocr ? '1' : '0');
     form.append('ocr_lang', state.lang);
+    form.append('ocr_review', state.ocr && state.review ? '1' : '0');
     form.append('output_filename', '{filename}');
     form.append('packaged_filename', 'docxify_converted');
     ready.forEach((f, i) => {
@@ -337,6 +341,7 @@
     link.setAttribute('download', result.download_filename);
     const files = result.files || [];
     const ocrPages = files.reduce((n, f) => n + (f.ocr_pages || 0), 0);
+    const marks = files.reduce((n, f) => n + (f.ocr_review_marks || 0), 0);
     const rows = [
       ['File', result.download_filename],
       ['Size', fmtSize(result.output_filesize)],
@@ -344,6 +349,9 @@
       ['OCR', ocrPages ? `${ocrPages} page${ocrPages === 1 ? '' : 's'} recognized` : 'Not used'],
       ['Time', `${Number(result.timer).toFixed(1)} s`],
     ];
+    if (files.some((f) => f.ocr_review_marks !== undefined)) {
+      rows.splice(4, 0, ['Proofread', marks ? `${plural(marks, 'passage')} highlighted` : 'Nothing uncertain']);
+    }
     const dl = $('summary');
     dl.replaceChildren(...rows.flatMap(([k, v]) => {
       const dt = document.createElement('dt'); dt.textContent = k;
