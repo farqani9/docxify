@@ -23,7 +23,8 @@ import make_fixtures as F  # noqa: E402
 from server import engine  # noqa: E402
 
 FIX = ROOT / "tests" / "fixtures"
-if not all((FIX / n).exists() for n in ("digital.pdf", "arabic_digital.pdf", "arabic_scanned.pdf")):
+if not all((FIX / n).exists() for n in ("digital.pdf", "arabic_digital.pdf", "arabic_shaped.pdf",
+                                        "arabic_scanned.pdf")):
     sys.exit("Run tests/make_fixtures.py first.")
 
 
@@ -108,6 +109,19 @@ with tempfile.TemporaryDirectory() as tmp:
     ok &= check(s["h1"] == [F.AR_TITLE] and s["h2"] == [F.AR_HEADINGS[0]], "title and heading styles")
     ok &= check([b.strip() for b in s["bullets"]] == F.AR_BULLETS, "3 bulleted list items, exact text")
     ok &= check(rtl_marked(ar_dig), "paragraphs, runs and section are right-to-left")
+
+    print("Arabic shaped (glyph-level text layer, bordered table)")
+    ar_shp = Path(tmp) / "as.docx"
+    engine.convert(FIX / "arabic_shaped.pdf", ar_shp)
+    s = structure(ar_shp)
+    table = s["tables"][0] if s["tables"] else []
+    ok &= check(s["h1"] == [F.AR_TITLE] and len(s["h2"]) == 2, "title is Heading 1 (not merged with the subtitle), two Heading 2")
+    ok &= check(len(s["bullets"]) == 3, "3 bulleted list items")
+    ok &= check(len(table) == 4 and all(len(r) == 3 for r in table) and [r[1] for r in table[1:]] == ["7.1", "7.3", "7.6"],
+                "table rebuilt cell by cell (4 x 3)")
+    ok &= check(bool(table) and table[0][1].endswith("(pH)"), "brackets in reading order: \"(pH)\"")
+    ok &= check(any(p.endswith("2026") and "pH" in p for p in s["text"].split("\n")), "numbers and Latin in place")
+    ok &= check(rtl_marked(ar_shp), "paragraphs, runs and section are right-to-left")
 
     print("Arabic scanned + OCR")
     s = structure(ar_ocr)

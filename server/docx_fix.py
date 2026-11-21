@@ -135,11 +135,124 @@ def normalize_fonts(doc) -> int:
 _FLOAT = re.compile(r"^-?\d+\.\d+$")
 
 
+def _sort_children(parent) -> None:
+    """Put a property container's children in schema order (stable for unknowns)."""
+    seq = _SEQ[_local(parent.tag)]
+    kids = list(parent)
+    ranked = sorted(kids, key=lambda c: seq.index(_local(c.tag)) if _local(c.tag) in seq else len(seq))
+    if ranked != kids:
+        for c in kids:
+            parent.remove(c)
+        for c in ranked:
+            parent.append(c)
+
+
+def split_size_changes(doc) -> int:
+    """pdf2docx can put a title, its subtitle and the body in one paragraph, lines
+    separated by breaks. Where the text size jumps across a break (by a quarter or
+    more), start a new paragraph so each part gets its own style."""
+    made = 0
+
+    def size(r):
+        sz = r.find(f"{W}rPr/{W}sz")
+        return int(sz.get(W + "val")) / 2 if sz is not None and sz.get(W + "val") else None
+
+    for p in list(doc.element.body.iter(W + "p")):
+        if p.getparent() is not doc.element.body:
+            continue
+        kids = [c for c in p if c.tag != W + "pPr"]
+        rtl = is_rtl("".join(t.text or "" for t in p.iter(W + "t")))
+        cut_after = []                         # break run ending a part, or ("before", k)
+        last, pending = None, None
+        for k, c in enumerate(kids):
+            if c.tag != W + "r":
+                continue
+            if c.find(W + "br") is not None and not _run_text(c).strip():
+                pending = k
+                continue
+            if _run_text(c).strip():
+                s = size(c)
+                jump = bool(s and last and max(s, last) / min(s, last) >= (1.15 if rtl else 1.25))
+                if jump and pending is not None:
+                    cut_after.append(pending)
+                elif jump and rtl and k > 0:
+                    # right-to-left lines arrive one run per line, without breaks
+                    cut_after.append(("before", k))
+                pending = None
+                last = s or last
+        if not cut_after:
+            continue
+        ppr = p.find(W + "pPr")
+        groups, start = [], 0
+        for k in cut_after:
+            if isinstance(k, tuple):           # cut right before run k, nothing to drop
+                groups.append(kids[start:k[1]])
+                start = k[1]
+            else:
+                groups.append(kids[start:k])
+                start = k + 1
+        groups.append(kids[start:])
+        for k in cut_after:
+            if not isinstance(k, tuple):
+                p.remove(kids[k])
+        anchor = p
+        for g in groups[1:]:
+            np_ = OxmlElement("w:p")
+            if ppr is not None:
+                np_.append(copy.deepcopy(ppr))
+            for c in g:
+                np_.append(c)
+            anchor.addnext(np_)
+            anchor = np_
+            made += 1
+    return made
+
+
+def trim_edge_breaks(doc) -> int:
+    """A plain line break at the very start or end of a paragraph only adds an empty
+    line (left over where items or lines were split apart). Page breaks stay."""
+    trimmed = 0
+
+    def plain_br(el) -> bool:
+        return el.tag == W + "br" and el.get(W + "type") in (None, "textWrapping")
+
+    for p in doc.element.body.iter(W + "p"):
+        for edge in ("end", "start"):
+            while True:
+                runs = [r for r in p if r.tag == W + "r"]
+                if not runs:
+                    break
+                r = runs[-1] if edge == "end" else runs[0]
+                kids = [k for k in r if k.tag != W + "rPr"]
+                if not kids:                      # empty run: look past it
+                    p.remove(r)
+                    continue
+                k = kids[-1] if edge == "end" else kids[0]
+                if plain_br(k):
+                    r.remove(k)
+                    trimmed += 1
+                    continue
+                break
+    return trimmed
+
+
+def sort_properties(doc) -> None:
+    """Schema order for every pPr/rPr/tblPr/sectPr (pdf2docx and later edits append
+    children out of order; Pages then ignores some of them, e.g. pStyle or bidi)."""
+    names = {W + n for n in _SEQ}
+    for root in _parts(doc):
+        for el in root.iter():
+            if isinstance(el.tag, str) and el.tag in names:
+                _sort_children(el)
+
+
 def sanitize(doc) -> None:
     """Integer measurements, bare hex colours, complete shading (valid OOXML)."""
     for el in doc.element.iter():
         if not isinstance(el.tag, str):
             continue
+        if el.tag == W + "tblPr":
+            _sort_children(el)
         for k, v in list(el.attrib.items()):
             if _FLOAT.match(v):
                 el.set(k, str(int(round(float(v)))))
@@ -303,6 +416,88 @@ def join_split_tables(doc, boundaries: list) -> int:
     return joined
 
 
+def merge_header_rows(doc) -> int:
+    """pdf2docx turns a filled, borderless header row into a separate one-row table,
+    with column widths guessed from its text. When the next block is a table with as
+    many columns over the same span, the row is that table's header: move it there,
+    take the table's column widths, and repeat it on each page."""
+    merged = 0
+    body = doc.element.body
+    for t1 in list(body.iter(W + "tbl")):
+        if t1.getparent() is not body:
+            continue
+        rows = t1.findall(W + "tr")
+        if not 1 <= len(rows) <= 3:
+            continue
+        if len(rows) > 1:
+            # a header whose cells wrap is read as one row per text line: only when
+            # every cell is filled (a coloured header band) and the rows line up
+            def filled(tc):
+                shd = tc.find(f"{W}tcPr/{W}shd")
+                return shd is not None and (shd.get(W + "fill") or "auto").lower() not in ("auto", "ffffff")
+
+            def has_text(tc):
+                return bool("".join(t.text or "" for t in tc.iter(W + "t")).strip())
+
+            # first row fully coloured; later rows coloured wherever they hold text
+            shaded = all(filled(tc) for tc in rows[0].findall(W + "tc")) and \
+                all(filled(tc) for tr in rows[1:] for tc in tr.findall(W + "tc") if has_text(tc))
+            if not shaded or len({len(tr.findall(W + "tc")) for tr in rows}) != 1:
+                continue
+        nxt = t1.getnext()
+        while nxt is not None and _is_empty_p(nxt):
+            nxt = nxt.getnext()
+        if nxt is None or nxt.tag != W + "tbl":
+            continue
+        cells1 = rows[0].findall(W + "tc")
+        g2 = [int(c.get(W + "w") or 0) for c in nxt.findall(f"{W}tblGrid/{W}gridCol")]
+        if len(cells1) < 2 or len(cells1) != len(g2) or any(_cell_span(tc) != 1 for tc in cells1):
+            continue
+
+        def span(t):
+            ind = t.find(f"{W}tblPr/{W}tblInd")
+            x0 = int(ind.get(W + "w") or 0) if ind is not None else 0
+            return x0, x0 + sum(int(c.get(W + "w") or 0) for c in t.findall(f"{W}tblGrid/{W}gridCol"))
+
+        (a0, a1), (b0, b1) = span(t1), span(nxt)
+        if abs(a0 - b0) > 200 or abs(a1 - b1) > 200:
+            continue
+        for tr in rows[1:]:              # fold the extra text lines into the first row
+            for tc0, tc in zip(cells1, tr.findall(W + "tc")):
+                for p in tc.findall(W + "p"):
+                    if "".join(t.text or "" for t in p.iter(W + "t")).strip():
+                        tc0.append(p)
+            t1.remove(tr)
+        for tc0 in cells1:               # drop the empty paragraphs the fold leaves first
+            ps = tc0.findall(W + "p")
+            filled = [p for p in ps if "".join(t.text or "" for t in p.iter(W + "t")).strip()]
+            for p in ps:
+                if filled and p not in filled:
+                    tc0.remove(p)
+        for tc, w in zip(cells1, g2):
+            tcw = tc.find(f"{W}tcPr/{W}tcW")
+            if tcw is not None:
+                tcw.set(W + "w", str(w))
+                tcw.set(W + "type", "dxa")
+        trpr = rows[0].find(W + "trPr")
+        if trpr is None:
+            trpr = OxmlElement("w:trPr")
+            rows[0].insert(0, trpr)
+        if trpr.find(W + "tblHeader") is None:
+            trpr.append(OxmlElement("w:tblHeader"))
+        first = nxt.find(W + "tr")
+        first.addprevious(rows[0])
+        el = t1.getnext()
+        while el is not None and el is not nxt:
+            following = el.getnext()
+            if _is_empty_p(el):
+                body.remove(el)
+            el = following
+        body.remove(t1)
+        merged += 1
+    return merged
+
+
 _INLINE_BULLETS = "\u2022\u25aa\u25cf\u25e6\u2023\u2043\u2219"   # not "\u00b7": it is also a separator
 
 
@@ -314,13 +509,16 @@ def split_inline_bullets(doc) -> int:
     """pdf2docx sometimes packs a whole bulleted list into one paragraph
     ("item one\u2022item two<br/>\u2022item three"): give every item its own paragraph."""
     made = 0
+    number = re.compile(r"\s*\d{1,3}[.)]\s")
     for p in list(doc.element.body.iter(W + "p")):
         children = [c for c in p if c.tag != W + "pPr"]
         cuts, seen = [], False
+        # a numbered item paragraph holding the next numbered item(s) too
+        numbered = bool(number.match("".join(t.text or "" for t in p.iter(W + "t"))))
         for idx, ch in enumerate(children):
             txt = _run_text(ch) if ch.tag in (W + "r", W + "hyperlink") else ""
             head = txt.strip()[:1]
-            if seen and head and head in _INLINE_BULLETS:
+            if seen and head and (head in _INLINE_BULLETS or (numbered and number.match(txt))):
                 cuts.append(idx)
             if txt.strip():
                 seen = True
@@ -346,18 +544,25 @@ def split_inline_bullets(doc) -> int:
             return seg
 
         ppr = p.find(W + "pPr")
+        after = None
+        if ppr is not None and ppr.find(W + "spacing") is not None:
+            after = ppr.find(W + "spacing").get(W + "after")
+            if after:
+                ppr.find(W + "spacing").set(W + "after", "0")   # the gap follows the last item
         for ch in children:
             p.remove(ch)
         for ch in trim(segments[0]):
             p.append(ch)
         anchor = p
-        for seg in segments[1:]:
+        for k, seg in enumerate(segments[1:]):
             np_ = OxmlElement("w:p")
             if ppr is not None:
                 ppr2 = copy.deepcopy(ppr)
                 sp = ppr2.find(W + "spacing")
                 if sp is not None and sp.get(W + "before"):
                     sp.set(W + "before", "20")   # the gap belonged before the first item only
+                if sp is not None and after and k == len(segments) - 2:
+                    sp.set(W + "after", after)
                 np_.append(ppr2)
             for ch in trim(seg):
                 np_.append(ch)
@@ -371,6 +576,8 @@ def fix_bullets(doc) -> int:
     """Glyph + tab + hanging indent; drop wrap-continuation tabs inside paragraphs."""
     fixed = 0
     for p in list(doc.element.body.iter(W + "p")):
+        if is_rtl("".join(t.text or "" for t in p.iter(W + "t"))):
+            continue   # its glyph/tab layout is left-to-right; RTL items keep "• text"
         runs = [r for r in p.iterchildren(W + "r")]
         texts = [(r, r.find(W + "t")) for r in runs]
         first = next(((r, t) for r, t in texts if t is not None and (t.text or "").strip()), None)
@@ -645,7 +852,7 @@ def _build_band(container, items: list, page_w: float, left: float, right: float
                     continue
                 if layout._is_rtl("".join(s.text for s in it.spans)):
                     main = max(it.spans, key=lambda s: len(s.text.strip()))
-                    _text_run(p, layout.logical_line_text(
+                    _text_run(p, it.logical or layout.logical_line_text(
                         [{"bbox": s.bbox, "text": s.text} for s in it.spans]), main)
                     continue
                 roles = list(it.digit_roles)
@@ -791,6 +998,7 @@ def fix_rtl(doc) -> dict:
     """Mark right-to-left paragraphs and runs the way Word expects for Arabic."""
     paras = rtl = 0
     for root in _parts(doc):
+        in_band = root is not doc.element.body
         for p in root.iter(W + "p"):
             text = "".join(t.text or "" for t in p.iter(W + "t"))
             if not text.strip():
@@ -803,6 +1011,11 @@ def fix_rtl(doc) -> dict:
             if ppr is None:
                 ppr = OxmlElement("w:pPr")
                 p.insert(0, ppr)
+            if in_band and (p.find(f".//{W}tab") is not None or p.find(f".//{W}ptab") is not None):
+                # header/footer items placed with tab stops measured from the left:
+                # a right-to-left paragraph would mirror them. Only the runs are RTL.
+                _mark_rtl_runs(p)
+                continue
             _ordered_child(ppr, "bidi")
             jc = ppr.find(W + "jc")
             if jc is not None and jc.get(W + "val") in ("left", "right", "start", "end"):
@@ -810,30 +1023,60 @@ def fix_rtl(doc) -> dict:
             ind = ppr.find(W + "ind")
             if ind is not None:           # PDF left offsets are meaningless once mirrored
                 ppr.remove(ind)
-            for r in p.iter(W + "r"):
-                rt = "".join(t.text or "" for t in r.findall(W + "t"))
-                if not rt:
-                    continue
-                rpr = r.find(W + "rPr")
-                if rpr is None:
-                    rpr = OxmlElement("w:rPr")
-                    r.insert(0, rpr)
-                fonts = _ordered_child(rpr, "rFonts")
-                base = map_font(fonts.get(W + "ascii") or "") or ""
-                fonts.set(W + "cs", base if base in ("Arial", "Times New Roman") else "Arial")
-                sz = rpr.find(W + "sz")
-                if sz is not None and sz.get(W + "val"):
-                    _ordered_child(rpr, "szCs").set(W + "val", sz.get(W + "val"))
-                b = rpr.find(W + "b")
-                if b is not None and b.get(W + "val", "true") not in ("0", "false"):
-                    _ordered_child(rpr, "bCs")
-                if _RTL_CHARS.search(rt):
-                    _ordered_child(rpr, "rtl")
-                    _ordered_child(rpr, "lang").set(W + "bidi", "ar-SA")
+            if not in_band:
+                _drop_layout_tabs(p, ppr)
+            _mark_rtl_runs(p)
     if paras and rtl / paras >= 0.5:      # mostly RTL: right-to-left page layout
         for sect in doc.element.body.iter(W + "sectPr"):
             _ordered_child(sect, "bidi")
     return {"rtl_paragraphs": rtl}
+
+
+def _drop_layout_tabs(p, ppr) -> None:
+    """pdf2docx places the short last line of a right-to-left paragraph with a tab
+    (it measures from the left); in flowing RTL text that tab is just a word gap."""
+    tabs = ppr.find(W + "tabs")
+    if tabs is not None:
+        ppr.remove(tabs)
+    runs = list(p.iter(W + "r"))
+    for k, r in enumerate(runs):
+        tab = r.find(W + "tab")
+        if tab is None or _run_text(r).strip():
+            continue
+        before = "".join(_run_text(x) for x in runs[:k])
+        after = "".join(_run_text(x) for x in runs[k + 1:])
+        if not before.strip() or not after.strip() or before.endswith((" ", "\u00a0")) or after.startswith(" "):
+            r.remove(tab)                # leading/trailing tab, or a space is already there
+        else:
+            t = OxmlElement("w:t")
+            t.text = " "
+            t.set(qn("xml:space"), "preserve")
+            tab.addprevious(t)
+            r.remove(tab)
+
+
+def _mark_rtl_runs(p) -> None:
+    """Right-to-left run marks: complex-script font, size, weight, language."""
+    for r in p.iter(W + "r"):
+        rt = "".join(t.text or "" for t in r.findall(W + "t"))
+        if not rt:
+            continue
+        rpr = r.find(W + "rPr")
+        if rpr is None:
+            rpr = OxmlElement("w:rPr")
+            r.insert(0, rpr)
+        fonts = _ordered_child(rpr, "rFonts")
+        base = map_font(fonts.get(W + "ascii") or "") or ""
+        fonts.set(W + "cs", base if base in ("Arial", "Times New Roman") else "Arial")
+        sz = rpr.find(W + "sz")
+        if sz is not None and sz.get(W + "val"):
+            _ordered_child(rpr, "szCs").set(W + "val", sz.get(W + "val"))
+        b = rpr.find(W + "b")
+        if b is not None and b.get(W + "val", "true") not in ("0", "false"):
+            _ordered_child(rpr, "bCs")
+        if _RTL_CHARS.search(rt):
+            _ordered_child(rpr, "rtl")
+            _ordered_child(rpr, "lang").set(W + "bidi", "ar-SA")
 
 
 # ------------------------------------------------------------------ facade
@@ -842,22 +1085,27 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
     doc = Document(str(path))
     stats = {"fonts_mapped": normalize_fonts(doc)}
     sanitize(doc)
+    # real text first: later steps look at it (bullets, repeated table header rows)
+    stats["rtl_lines_restored"] = substitute_placeholders(doc, placeholders or {})
+    normalize_arabic_forms(doc)
     stats.update(relax_heights(doc))
     stats["table_grids_fixed"] = fix_table_grids(doc)
     boundaries = merge_sections(doc)
     stats["sections_merged"] = len(boundaries)
+    stats["header_rows_merged"] = merge_header_rows(doc)
     stats["tables_joined"] = join_split_tables(doc, boundaries)
     stats["cell_indents_fixed"] = fix_cell_indents(doc)
     zero_cell_vertical_margins(doc)
     stats["letter_spaced"] = restore_letter_spacing(doc)
+    stats["size_breaks_split"] = split_size_changes(doc)
     stats["bullet_items_split"] = split_inline_bullets(doc)
     stats["bullets_fixed"] = fix_bullets(doc)
     if body_rules:
         stats["rules_as_borders"] = apply_body_rules(doc, body_rules)
     if bands is not None and source_pdf is not None:
         stats.update({f"{k}_rebuilt": v for k, v in add_header_footer(doc, bands, source_pdf).items()})
-    stats["rtl_lines_restored"] = substitute_placeholders(doc, placeholders or {})
-    normalize_arabic_forms(doc)
+    # header/footer runs were rebuilt from the source text: no placeholders there
     stats.update(fix_rtl(doc))
+    stats["edge_breaks_trimmed"] = trim_edge_breaks(doc)
     doc.save(str(path))
     return stats

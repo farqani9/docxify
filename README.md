@@ -173,6 +173,9 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
   get right-to-left paragraphs, but they're less tested.
 - On Arabic scans, font sizes are estimated from line width and height, so a heading only
   slightly larger than body text can be missed.
+- OCR rebuilds tables from their visible ruling lines. Very light borders (common in PDFs
+  printed from a browser) can vanish in a scan, and those tables then come out as loose
+  text.
 - Layout fidelity on complex digital PDFs depends on pdf2docx, and very dense layouts may
   need touch-ups.
 

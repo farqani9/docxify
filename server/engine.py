@@ -816,6 +816,55 @@ def _run_size(run, default: float) -> float:
     return run.font.size.pt if run.font.size else default
 
 
+def _restart_numbering(doc, groups: list) -> None:
+    """Each numbered list starts at 1: its own numbering instance of the list style."""
+    if len(groups) < 2:
+        return
+    try:
+        numbering = doc.part.numbering_part.element
+        style_num = doc.styles["List Number"].element.pPr.numPr.numId.val
+        abstract = next(n.abstractNumId.val for n in numbering.num_lst if n.numId == style_num)
+    except Exception:
+        return
+    for group in groups[1:]:
+        num = numbering.add_num(abstract)
+        num.add_lvlOverride(ilvl=0).add_startOverride(1)
+        for p in group:
+            numpr = p._p.get_or_add_pPr().get_or_add_numPr()
+            numpr.get_or_add_ilvl().val = 0
+            numpr.get_or_add_numId().val = num.numId
+
+
+def _tighten_lists(doc) -> None:
+    """Items of one list sit at the source line pitch. When the converter's line
+    spacing already spans that pitch (seen with right-to-left lines), the before/after
+    gap it adds to every item comes on top of it, so the gaps between items go."""
+    from docx.shared import Pt
+
+    paras = doc.paragraphs
+    k = 0
+    while k < len(paras):
+        if not paras[k].style.name.startswith("List"):
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(paras) and paras[j + 1].style.name.startswith("List") \
+                and paras[j]._p.getnext() is paras[j + 1]._p:
+            j += 1
+        for i in range(k, j + 1):
+            pf = paras[i].paragraph_format
+            ls = pf.line_spacing
+            size = max((r.font.size.pt for r in paras[i].runs if r.font.size), default=11.0)
+            # only when the line spacing already spans a whole source line pitch
+            if not (hasattr(ls, "pt") and ls.pt >= 1.6 * size):
+                continue
+            if i > k and (pf.space_before or 0) > 0:
+                pf.space_before = Pt(0)
+            if i < j and (pf.space_after or 0) > 0:
+                pf.space_after = Pt(0)
+        k = j + 1
+
+
 def enrich_docx(path: str | Path, title: str = "") -> dict:
     """Reflow paragraphs and add heading/list styles without changing the look."""
     from docx import Document
@@ -883,6 +932,24 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
         if level <= 3:
             levels[s] = level
     headings = 0
+    # A long heading wrapped onto a second line comes out as two paragraphs.
+    for p, size, rtl in list(candidates):
+        nxt = p._p.getnext()
+        mate = next((c for c in candidates if c[0]._p is nxt), None)
+        if mate is None or mate[1] != size or mate[0] is p:
+            continue
+        first, second = p.text.strip(), mate[0].text.strip()
+        if len(first.split()) >= 5 and len(second) <= len(first) and not first.endswith((".", ":", "\u061f", "?", "!")) \
+                and not _NUMBER.match(second) and not _BULLET.match(second):
+            moved = list(mate[0]._p.iter(W + "r"))
+            ts = [t for r in moved for t in r.iter(W + "t")]
+            if ts and not p.text.endswith((" ", "\u00a0")) and not (ts[0].text or "").startswith(" "):
+                ts[0].text = " " + (ts[0].text or "")          # the line break was a space
+                ts[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            for r in moved:
+                p._p.append(r)
+            mate[0]._p.getparent().remove(mate[0]._p)
+            candidates.remove(mate)
     for p, size, rtl in candidates:
         if size in levels:
             if rtl and size != level_top[levels[size]]:
@@ -910,6 +977,7 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
 
     list_items = 0
     numbered_run: list = []
+    numbered_groups: list = []
 
     def flush_numbered():
         nonlocal list_items
@@ -919,6 +987,7 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
                 strip_marker(q, _NUMBER)
                 q.style = doc.styles["List Number"]
                 list_items += 1
+            numbered_groups.append(list(numbered_run))
         numbered_run.clear()
 
     for p in paras:
@@ -939,6 +1008,9 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
         else:
             flush_numbered()
     flush_numbered()
+    _restart_numbering(doc, numbered_groups)
+    _tighten_lists(doc)
+    docx_fix.sort_properties(doc)
 
     if not title:
         first = next((p for p in doc.paragraphs if p.style.name == "Heading 1"), None)

@@ -5,8 +5,12 @@
                 noise, saved as image-only pages (no text layer) -> needs OCR
 - arabic_digital.pdf : a right-to-left Arabic page with a text layer, mixed with
                 numbers and Latin ("pH")
-- arabic_scanned.pdf : a shaped Arabic page (headings, list, table) scanned the
-                same way -> needs OCR with lang="ar"
+- arabic_shaped.pdf : a shaped right-to-left Arabic page (presentation-form glyphs,
+                headings, list, bordered table with "(pH)"), as an HTML renderer
+                writes it. Its text layer maps lam glyphs wrongly (a MuPDF quirk), so
+                it is checked for structure, bracket order and numbers only.
+- arabic_scanned.pdf : arabic_shaped.pdf scanned the same way -> needs OCR with
+                lang="ar"
 """
 from pathlib import Path
 
@@ -228,11 +232,10 @@ def make_arabic_digital(path):
 if __name__ == "__main__":
     make_digital(OUT / "digital.pdf")
     make_scanned(OUT / "digital.pdf", OUT / "scanned.pdf")
-    make_arabic_source(OUT / "_arabic_source.pdf")
-    make_scanned(OUT / "_arabic_source.pdf", OUT / "arabic_scanned.pdf", seed=11)
-    (OUT / "_arabic_source.pdf").unlink()
+    make_arabic_source(OUT / "arabic_shaped.pdf")
+    make_scanned(OUT / "arabic_shaped.pdf", OUT / "arabic_scanned.pdf", seed=11)
     make_arabic_digital(OUT / "arabic_digital.pdf")
-    for name in ("digital.pdf", "scanned.pdf", "arabic_scanned.pdf", "arabic_digital.pdf"):
+    for name in ("digital.pdf", "scanned.pdf", "arabic_shaped.pdf", "arabic_scanned.pdf", "arabic_digital.pdf"):
         d = pymupdf.open(OUT / name)
         chars = sum(len(p.get_text().strip()) for p in d)
         print(f"{name}: {d.page_count} pages, {chars} extractable chars, "
