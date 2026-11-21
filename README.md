@@ -202,10 +202,12 @@ New:
   fonts and sizes.
 - **Tables.** A coloured header row that the layout converter splits off goes back on top
   of its table, and repeats on each page.
-- **Lists.** Numbered lists restart at 1, items packed into one paragraph are split, and
+- **Lists.** Numbered lists follow the source: a new list starts at 1, and a list that
+  continues after a note keeps counting. Items packed into one paragraph are split, and
   bullets that browsers draw as shapes become list items in right-to-left text.
 - **Headers and footers** are found in PDFs printed from a browser, where white background
-  boxes used to hide them.
+  boxes used to hide them. Arabic headers and footers keep live page numbers
+  ("صفحة 2 من 5"), on scans as well.
 - **Paragraphs.** A heading that wraps onto two lines becomes one paragraph. A title,
   subtitle and body packed into one paragraph are split apart.
 - **Web app.** The language list fits its panel, and file counts read "1 page".

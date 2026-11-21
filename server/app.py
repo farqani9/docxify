@@ -5,7 +5,7 @@ A small task-based HTTP API (the web UI in ``web/`` is its only client):
   POST   /v1/start                     -> {"server", "task"}
   POST   /v1/upload                    chunked (2 MB): {"chunks","chunk"} ... then
                                        {"server_filename","scanned","pages",...}
-  POST   /v1/process                   convert_to=docx, ocr=0|1, ocr_lang=en|latin,
+  POST   /v1/process                   convert_to=docx, ocr=0|1, ocr_lang=en|latin|ar,
                                        files[i][server_filename], files[i][filename]
   GET    /v1/task/{task}               status + progress (polled by the progress bar)
   GET    /v1/download/{task}           .docx (one file) or .zip (several)

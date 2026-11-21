@@ -94,7 +94,7 @@ const assert = (cond, msg) => { if (!cond) throw new Error('ASSERT: ' + msg); co
   await page.click('#delete-now');
   await page.waitForSelector('#view-select.is-active');
 
-  // 3) mobile layout
+  // 4) mobile layout
   const m = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, hasTouch: true });
   const mp = await m.newPage();
   await mp.goto(base, { waitUntil: 'load' });

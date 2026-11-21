@@ -45,7 +45,7 @@ _FONT_PREFIXES = [
 ]
 
 # Placeholder tokens written by the OCR step for right-to-left lines.
-PLACEHOLDER = re.compile(r"QXR\d{5}Z+")
+PLACEHOLDER = layout.PLACEHOLDER
 _RTL_CHARS = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
 _LTR_LETTERS = re.compile(r"[A-Za-z\u00C0-\u024F]")
 _ARABIC_FORMS = re.compile(r"[\uFB50-\uFDFF\uFE70-\uFEFC]+")
@@ -429,21 +429,20 @@ def merge_header_rows(doc) -> int:
         rows = t1.findall(W + "tr")
         if not 1 <= len(rows) <= 3:
             continue
-        if len(rows) > 1:
-            # a header whose cells wrap is read as one row per text line: only when
-            # every cell is filled (a coloured header band) and the rows line up
-            def filled(tc):
-                shd = tc.find(f"{W}tcPr/{W}shd")
-                return shd is not None and (shd.get(W + "fill") or "auto").lower() not in ("auto", "ffffff")
+        # a coloured header band (a header whose cells wrap is read as one row per
+        # text line); a plain one-row table is left alone
+        def filled(tc):
+            shd = tc.find(f"{W}tcPr/{W}shd")
+            return shd is not None and (shd.get(W + "fill") or "auto").lower() not in ("auto", "ffffff")
 
-            def has_text(tc):
-                return bool("".join(t.text or "" for t in tc.iter(W + "t")).strip())
+        def has_text(tc):
+            return bool("".join(t.text or "" for t in tc.iter(W + "t")).strip())
 
-            # first row fully coloured; later rows coloured wherever they hold text
-            shaded = all(filled(tc) for tc in rows[0].findall(W + "tc")) and \
-                all(filled(tc) for tr in rows[1:] for tc in tr.findall(W + "tc") if has_text(tc))
-            if not shaded or len({len(tr.findall(W + "tc")) for tr in rows}) != 1:
-                continue
+        # first row fully coloured; later rows coloured wherever they hold text
+        shaded = all(filled(tc) for tc in rows[0].findall(W + "tc")) and \
+            all(filled(tc) for tr in rows[1:] for tc in tr.findall(W + "tc") if has_text(tc))
+        if not shaded or len({len(tr.findall(W + "tc")) for tr in rows}) != 1:
+            continue
         nxt = t1.getnext()
         while nxt is not None and _is_empty_p(nxt):
             nxt = nxt.getnext()
@@ -513,15 +512,30 @@ def split_inline_bullets(doc) -> int:
     for p in list(doc.element.body.iter(W + "p")):
         children = [c for c in p if c.tag != W + "pPr"]
         cuts, seen = [], False
-        # a numbered item paragraph holding the next numbered item(s) too
-        numbered = bool(number.match("".join(t.text or "" for t in p.iter(W + "t"))))
+        whole = "".join(t.text or "" for t in p.iter(W + "t"))
+        # a numbered item (paragraph or piece already cut off) holding the next item(s) too
+        numbered = bool(number.match(whole))
+        rtl = is_rtl(whole)
+        in_body = p.getparent() is doc.element.body
+        before, prev_rtl = "", False
         for idx, ch in enumerate(children):
             txt = _run_text(ch) if ch.tag in (W + "r", W + "hyperlink") else ""
             head = txt.strip()[:1]
-            if seen and head and (head in _INLINE_BULLETS or (numbered and number.match(txt))):
+            is_number = bool(number.match(txt))
+            marker = head in _INLINE_BULLETS or is_number
+            # right-to-left lines arrive one run per line: an item after a finished
+            # sentence, or a left-to-right line after an Arabic one, starts a new paragraph
+            after_sentence = rtl and before.rstrip().endswith((".", ":", "!", "?", "\u061f", "\u061b"))
+            ltr_line = rtl and in_body and prev_rtl and bool(txt.strip()) and not _RTL_CHARS.search(txt) \
+                and bool(re.search(r"[A-Za-z0-9]", txt))
+            if seen and head and (head in _INLINE_BULLETS or (numbered and is_number)
+                                  or (marker and after_sentence) or ltr_line):
                 cuts.append(idx)
+                numbered = is_number
             if txt.strip():
                 seen = True
+                before += txt
+                prev_rtl = bool(_RTL_CHARS.search(txt))
         if not cuts:
             continue
         bounds = [0] + cuts + [len(children)]
@@ -852,8 +866,29 @@ def _build_band(container, items: list, page_w: float, left: float, right: float
                     continue
                 if layout._is_rtl("".join(s.text for s in it.spans)):
                     main = max(it.spans, key=lambda s: len(s.text.strip()))
-                    _text_run(p, it.logical or layout.logical_line_text(
-                        [{"bbox": s.bbox, "text": s.text} for s in it.spans]), main)
+                    text = it.logical or layout.logical_line_text(
+                        [{"bbox": s.bbox, "text": s.text} for s in it.spans])
+                    # numbers are matched by value: reading order differs from extraction
+                    values = [int(x) for x in re.findall(r"\d+", "".join(s.text for s in it.spans))]
+                    pool = [(v, r) for v, r in zip(values, it.digit_roles) if r]
+                    if not pool:                 # one run keeps the line's bidi order intact
+                        _text_run(p, text, main)
+                        continue
+                    plain = ""
+                    for tok in re.split(r"(\d+)", text):
+                        hit = next((pr for pr in pool if tok.isdigit() and pr[0] == int(tok)), None)
+                        if not hit:
+                            plain += tok
+                            continue
+                        if plain:
+                            _text_run(p, plain, main)
+                            plain = ""
+                        pool.remove(hit)
+                        _field(p, hit[1], tok, main)
+                        for rpr in p._p[-1].iter(W + "rPr"):    # page number inside RTL text
+                            _ordered_child(rpr, "rtl")
+                    if plain:
+                        _text_run(p, plain, main)
                     continue
                 roles = list(it.digit_roles)
                 k = 0
@@ -899,13 +934,22 @@ def add_header_footer(doc, bands: layout.Bands, pdf_path) -> dict:
     return added
 
 
-def apply_body_rules(doc, rules: list) -> int:
+def apply_body_rules(doc, rules: list, placeholders: Optional[dict] = None) -> int:
     """Rules drawn under a paragraph in the PDF become that paragraph's bottom border."""
-    norm = lambda t: re.sub(r"\s+", " ", t).strip()
+    def norm(t: str) -> str:   # same form on both sides: forms unshaped, no harakat
+        t = unicodedata.normalize("NFKC", t)
+        t = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    def untoken(t: str) -> str:
+        if not placeholders:
+            return t
+        return PLACEHOLDER.sub(lambda m: (placeholders.get(layout.placeholder_key(m.group(0))) or {}).get("text", ""), t)
+
     paras = [p for p in doc.paragraphs if p.text.strip()]
     applied, start = 0, 0
     for rule in rules:
-        target = norm(rule["text_above"])
+        target = norm(untoken(rule["text_above"]))
         if len(target) < 3:
             continue
         for k in range(start, len(paras)):
@@ -933,6 +977,48 @@ def _parts(doc) -> list:
     return roots
 
 
+def break_rtl_lines(doc, mapping: dict) -> int:
+    """pdf2docx decides where a line ends by whether it reaches the right edge (a
+    left-to-right assumption); right-to-left lines are flush right, so every line looks
+    wrapped and a whole page can land in one paragraph without breaks. Each placeholder
+    is one source line: in body paragraphs, a line that starts a list item or changes
+    the text size gets a line break before it, so the reflow keeps it apart. Plain
+    continuation lines stay joined, as pdf2docx joined them."""
+    number = re.compile(r"\s*\d{1,3}[.)]\s")
+    made = 0
+
+    def info(txt: str) -> dict:
+        e = mapping.get(layout.placeholder_key(txt)) or {}
+        return e if isinstance(e, dict) else {"text": e}
+
+    for p in doc.element.body.iterchildren(W + "p"):
+        runs = [r for r in p if r.tag == W + "r"]
+        prev_token, between, prev_size = False, [], None
+        for r in runs:
+            txt = "".join(t.text or "" for t in r.findall(W + "t"))
+            only_space = not txt.strip() and r.find(W + "br") is None and r.find(W + "drawing") is None
+            if PLACEHOLDER.fullmatch(txt.strip() or "-"):
+                e = info(txt)
+                line, size = e.get("text", ""), e.get("size")
+                starts_item = line.strip()[:1] in _INLINE_BULLETS or bool(number.match(line))
+                size_jump = bool(size and prev_size and max(size, prev_size) / min(size, prev_size) >= 1.15)
+                if prev_token and (starts_item or size_jump) \
+                        and not any(b.find(W + "br") is not None for b in between):
+                    for b in between:             # tabs/spaces pdf2docx put between the lines
+                        if b.getparent() is not None:
+                            p.remove(b)
+                    br = OxmlElement("w:r")
+                    br.append(OxmlElement("w:br"))
+                    r.addprevious(br)
+                    made += 1
+                prev_token, between, prev_size = True, [], size or prev_size
+            elif only_space or r.find(W + "tab") is not None and not txt.strip():
+                between.append(r)
+            else:
+                prev_token, between = False, []
+    return made
+
+
 def substitute_placeholders(doc, mapping: dict) -> int:
     """Swap placeholder tokens for the logical-order text, with the intended font
     size and weight (the token itself was sized only to cover the right width)."""
@@ -940,7 +1026,7 @@ def substitute_placeholders(doc, mapping: dict) -> int:
         return 0
 
     def entry(tok: str) -> dict:
-        e = mapping.get(tok[:9], {"text": ""})
+        e = mapping.get(layout.placeholder_key(tok), {"text": ""})
         return e if isinstance(e, dict) else {"text": e}
 
     def style_run(r, e: dict) -> None:
@@ -957,6 +1043,11 @@ def substitute_placeholders(doc, mapping: dict) -> int:
                 el = _ordered_child(rpr, tag)
                 if not e["bold"]:
                     el.set(W + "val", "0")
+        if map_font(e.get("font") or "") == "Times New Roman":
+            # a serif (Naskh-style) source: the token itself was set in Helvetica
+            fonts = _ordered_child(rpr, "rFonts")
+            for a in ("ascii", "hAnsi", "cs"):
+                fonts.set(W + a, "Times New Roman")
 
     n = 0
     for root in _parts(doc):
@@ -980,6 +1071,12 @@ def substitute_placeholders(doc, mapping: dict) -> int:
                 if ts[0].getparent() is not None and ts[0].getparent().tag == W + "r":
                     style_run(ts[0].getparent(), entry(tok))
                 n += 1
+        # safety net: pieces of a token split across cells or paragraphs
+        for t in root.iter(W + "t"):
+            if t.text and (re.search(r"QXR\d+Z*", t.text) or re.fullmatch(r"\s*Z{2,}\s*", t.text)):
+                t.text = re.sub(r"QXR\d+Z*", "", t.text)
+                if re.fullmatch(r"\s*Z{2,}\s*", t.text):
+                    t.text = ""
     return n
 
 
@@ -1086,6 +1183,8 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
     stats = {"fonts_mapped": normalize_fonts(doc)}
     sanitize(doc)
     # real text first: later steps look at it (bullets, repeated table header rows)
+    if placeholders:
+        stats["rtl_line_breaks"] = break_rtl_lines(doc, placeholders)
     stats["rtl_lines_restored"] = substitute_placeholders(doc, placeholders or {})
     normalize_arabic_forms(doc)
     stats.update(relax_heights(doc))
@@ -1101,9 +1200,12 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
     stats["bullet_items_split"] = split_inline_bullets(doc)
     stats["bullets_fixed"] = fix_bullets(doc)
     if body_rules:
-        stats["rules_as_borders"] = apply_body_rules(doc, body_rules)
+        stats["rules_as_borders"] = apply_body_rules(doc, body_rules, placeholders or {})
     if bands is not None and source_pdf is not None:
         stats.update({f"{k}_rebuilt": v for k, v in add_header_footer(doc, bands, source_pdf).items()})
+        # header/footer text comes from the source PDF: on OCR pages that holds tokens too
+        stats["rtl_lines_restored"] += substitute_placeholders(doc, placeholders or {})
+        normalize_arabic_forms(doc)
     # header/footer runs were rebuilt from the source text: no placeholders there
     stats.update(fix_rtl(doc))
     stats["edge_breaks_trimmed"] = trim_edge_breaks(doc)

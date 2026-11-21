@@ -11,6 +11,11 @@
                 it is checked for structure, bracket order and numbers only.
 - arabic_scanned.pdf : arabic_shaped.pdf scanned the same way -> needs OCR with
                 lang="ar"
+- arabic_pages.pdf : three Arabic pages with a running header, a "صفحة N من 3"
+                footer, two numbered lists per page ("1." and "١.") and English lines;
+  arabic_pages_scanned.pdf : the same, scanned
+- generic.pdf : English page for clean-up rules: two same-size headings in a row and
+                a numbered list that continues at "3." after a note
 """
 from pathlib import Path
 
@@ -229,13 +234,57 @@ def make_arabic_digital(path):
     doc.save(path)
 
 
+AR_PAGES_HEADER = "تقرير ميداني ربع سنوي"
+
+
+def make_arabic_pages(path):
+    css = AR_CSS + " .hdr { font-size: 10pt; color: #333; } .ftr { font-size: 9pt; color: #333; text-align: center; }"
+    doc = pymupdf.open()
+    for n in range(1, 4):
+        page = doc.new_page(width=595, height=842)
+        page.insert_htmlbox(pymupdf.Rect(64, 30, 531, 50), f'<div dir="rtl" class="hdr">{AR_PAGES_HEADER}</div>', css=css)
+        body = (f'<div dir="rtl"><h2>القسم {n}</h2><p>{AR_BODY}</p>'
+                '<p>1. توريد الأجهزة الطبية</p><p>2. تدريب الفريق</p><p>3. صيانة دورية</p>'
+                '<p>١. مراجعة أولية</p><p>٢. موافقة نهائية</p>'
+                '<p dir="ltr">Contact: info@example.com</p><p dir="ltr">15,000 2024</p></div>')
+        page.insert_htmlbox(pymupdf.Rect(64, 170, 531, 760), body, css=css)
+        page.insert_htmlbox(pymupdf.Rect(64, 790, 531, 810), f'<div dir="rtl" class="ftr">صفحة {n} من 3</div>', css=css)
+    doc.save(path)
+
+
+def make_generic(path):
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    x, y = 64, 90
+    for line in ("Proposal for the Supply of Medical Equipment", "Ministry of Health"):
+        page.insert_text((x, y), line, fontname="hebo", fontsize=20)
+        y += 40
+    y += 10
+    page.insert_text((x, y), "The scope covers the items below.", fontname="helv", fontsize=11)
+    y += 24
+    for line in ("1. Deliver the equipment", "2. Train the staff"):
+        page.insert_text((x, y), line, fontname="helv", fontsize=11)
+        y += 18
+    y += 10
+    page.insert_text((x, y), "Maintenance follows.", fontname="helv", fontsize=11)
+    y += 24
+    for line in ("3. Maintain the equipment", "4. Report every quarter"):
+        page.insert_text((x, y), line, fontname="helv", fontsize=11)
+        y += 18
+    doc.save(path)
+
+
 if __name__ == "__main__":
     make_digital(OUT / "digital.pdf")
     make_scanned(OUT / "digital.pdf", OUT / "scanned.pdf")
     make_arabic_source(OUT / "arabic_shaped.pdf")
     make_scanned(OUT / "arabic_shaped.pdf", OUT / "arabic_scanned.pdf", seed=11)
     make_arabic_digital(OUT / "arabic_digital.pdf")
-    for name in ("digital.pdf", "scanned.pdf", "arabic_shaped.pdf", "arabic_scanned.pdf", "arabic_digital.pdf"):
+    make_arabic_pages(OUT / "arabic_pages.pdf")
+    make_scanned(OUT / "arabic_pages.pdf", OUT / "arabic_pages_scanned.pdf", seed=3)
+    make_generic(OUT / "generic.pdf")
+    for name in ("digital.pdf", "scanned.pdf", "arabic_shaped.pdf", "arabic_scanned.pdf", "arabic_digital.pdf",
+                 "arabic_pages.pdf", "arabic_pages_scanned.pdf", "generic.pdf"):
         d = pymupdf.open(OUT / name)
         chars = sum(len(p.get_text().strip()) for p in d)
         print(f"{name}: {d.page_count} pages, {chars} extractable chars, "

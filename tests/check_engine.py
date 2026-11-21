@@ -24,7 +24,7 @@ from server import engine  # noqa: E402
 
 FIX = ROOT / "tests" / "fixtures"
 if not all((FIX / n).exists() for n in ("digital.pdf", "arabic_digital.pdf", "arabic_shaped.pdf",
-                                        "arabic_scanned.pdf")):
+                                        "arabic_scanned.pdf", "arabic_pages.pdf", "generic.pdf")):
     sys.exit("Run tests/make_fixtures.py first.")
 
 
@@ -140,6 +140,53 @@ with tempfile.TemporaryDirectory() as tmp:
                 and [r[1] for r in table[1:]] == ["7.1", "7.3", "7.6"], "table rebuilt (4 x 3, values in place)")
     ok &= check(rtl_marked(ar_ocr), "paragraphs, runs and section are right-to-left")
     print(f"  info  Arabic OCR stats: {ar_stats}")
+
+    # ------------------------------------------- multi-page Arabic: header/footer, lists
+    def band(path):
+        d = docx.Document(str(path))
+        sec = d.sections[0]
+        header = " ".join(p.text.strip() for p in sec.header.paragraphs if p.text.strip())
+        fields = [f.get(qn("w:instr")).strip() for f in sec.footer._element.iter(qn("w:fldSimple"))]
+        paras = [p for p in d.paragraphs if p.text.strip()]
+        numbered = [p for p in paras if p.style.name == "List Number"]
+        starts = []
+        for p in numbered:
+            num = p._p.find(f"{qn('w:pPr')}/{qn('w:numPr')}/{qn('w:numId')}")
+            starts.append(num.get(qn("w:val")) if num is not None else "style")
+        text = "\n".join(p.text for p in paras)
+        return header, fields, numbered, starts, text
+
+    for label, name, ocr, min_items in (("Arabic pages (digital)", "arabic_pages.pdf", False, 15),
+                                        ("Arabic pages scanned + OCR", "arabic_pages_scanned.pdf", True, 9)):
+        print(label)
+        out = Path(tmp) / (name + ".docx")
+        engine.convert(FIX / name, out, ocr=ocr, lang="ar")
+        header, fields, numbered, starts, text = band(out)
+        ok &= check(header == F.AR_PAGES_HEADER, f"running header rebuilt in reading order ({header!r})")
+        ok &= check(fields[:2] == ["PAGE", "NUMPAGES"], "footer \"صفحة N من M\" keeps live page fields")
+        ok &= check(len(numbered) >= min_items, f"numbered items ({len(numbered)} of 15)")
+        ok &= check(len(set(starts)) >= 3, "each list counts on its own (\"1.\" and \"١.\" lists restart)")
+        ok &= check(not re.search(r"QXR\d|Z{3,}", text + header), "no placeholder text left")
+        ok &= check(not re.search(r"(?m)^\.\d", text), "list numbers in reading order (no \".2\")")
+        ok &= check(bool(re.search(r"(?m)^Contact: info@example\.com\s*$", text)), "English line is its own paragraph")
+
+    # ------------------------------------------- clean-up rules on an English page
+    print("clean-up rules (English)")
+    gen = Path(tmp) / "generic.docx"
+    engine.convert(FIX / "generic.pdf", gen)
+    d = docx.Document(str(gen))
+    heads = [p.text.strip() for p in d.paragraphs if p.style.name.startswith("Heading")]
+    ok &= check("Ministry of Health" in heads and len(heads) >= 2, "two same-size headings stay separate")
+    nums = [p for p in d.paragraphs if p.style.name == "List Number"]
+    overrides = [int(s.get(qn("w:val"))) for s in d.part.numbering_part.element.iter(qn("w:startOverride"))]
+    ok &= check(len(nums) == 4 and 3 in overrides, "a list continuing after a note keeps counting from 3")
+    from docx import Document as _Doc
+    from server import docx_fix
+    probe = _Doc()
+    probe.add_table(rows=1, cols=3)          # plain one-row table (no fill) ...
+    probe.add_paragraph("")
+    probe.add_table(rows=3, cols=3)          # ... above another table with as many columns
+    ok &= check(docx_fix.merge_header_rows(probe) == 0, "a plain one-row table is not taken for a header row")
 
 print("\nALL CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

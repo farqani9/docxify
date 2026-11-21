@@ -329,6 +329,38 @@ def _rtl_join(parts: list) -> str:
     return " ".join(words)
 
 
+def _dot_like(crop: np.ndarray, a: int, b: int) -> bool:
+    """The ink between columns a..b is a small, roughly round blob (a bullet dot)."""
+    _, bw = cv2.threshold(crop[:, a:b], 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    rows = np.where((bw > 0).sum(axis=1) > 0)[0]
+    cols = np.where((bw > 0).sum(axis=0) > 0)[0]
+    if not len(rows) or not len(cols):
+        return False
+    ih, iw = rows[-1] - rows[0] + 1, cols[-1] - cols[0] + 1
+    return ih <= 0.5 * crop.shape[0] and 0.6 <= iw / ih <= 1.7
+
+
+def _visual_join(parts: list) -> str:
+    """Reading-order text from pieces read left to right: Arabic pieces (logical order
+    from the Arabic model) are stored visually, left-to-right pieces as read, and the
+    Unicode bidi algorithm puts neutrals such as the dot of "2." where they belong."""
+    from bidi.algorithm import get_display
+
+    visual = []
+    for _x, text, ltr in sorted((p for p in parts if p[1]), key=lambda p: p[0]):
+        # logical -> visual flips only the right-to-left runs (digits keep their order)
+        visual.append(text if ltr else get_display(text, base_dir="R"))
+    return layout._logical_from_visual(" ".join(visual))
+
+
+_REVERSED_MARKER = re.compile(r"^([.)])\s?([0-9\u0660-\u0669]{1,3})(?=\s)")
+
+
+def _fix_marker(text: str) -> str:
+    """A list number read as ".2" or ")2" at the start of an Arabic line is "2." / "2)"."""
+    return _REVERSED_MARKER.sub(lambda m: m.group(2) + m.group(1), text)
+
+
 def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
     """Re-read an Arabic line in pieces.
 
@@ -343,8 +375,10 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
         return
     h = crop.shape[0]
     chunks = _ink_chunks(crop)
-    # a small compact blob at the right end (reading start) is a bullet
-    bullet = len(chunks) > 1 and (chunks[-1][1] - chunks[-1][0]) <= 0.45 * h and chunks[-1][2] >= 0.55
+    # a small round blob at the right end (reading start) is a bullet; a digit such as
+    # "1" or "١" is as narrow and dense, but much taller than wide
+    bullet = len(chunks) > 1 and (chunks[-1][1] - chunks[-1][0]) <= 0.45 * h and chunks[-1][2] >= 0.55 \
+        and _dot_like(crop, chunks[-1][0], chunks[-1][1])
     body = chunks[:-1] if bullet else chunks
     text = ln.text
     parts: list = []
@@ -381,10 +415,19 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
         if group:
             parts.append((group[-1][0], _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")[0], False))
     if parts:
-        joined = _rtl_join(parts)
+        joined = _rtl_join(parts) if not any(p[2] for p in parts) else _visual_join(parts)
         # never lose Arabic content to the cutting: keep the whole-line reading then
         if len(_ARABIC_LETTER.findall(joined)) >= 0.85 * len(_ARABIC_LETTER.findall(text)):
             text = joined
+    text = _fix_marker(text)
+    if chunks and not bullet and (chunks[-1][1] - chunks[-1][0]) <= 1.2 * h:
+        # a list number ("٢.", "3)") read alone: inside a word group it can get lost
+        a, b, _f = chunks[-1]
+        ta, _sa = _rec_only(crop[:, max(0, a - 3):b + 3], "ar")
+        if re.fullmatch(r"[.)]?\s?[0-9\u0660-\u0669]{1,3}\s?[.)]?", ta or "") and re.search(r"[.)]", ta):
+            digits = re.sub(r"[^0-9\u0660-\u0669]", "", ta)
+            closer = ")" if ")" in ta else "."
+            text = f"{digits}{closer} " + re.sub(r"^[\s.)0-9\u0660-\u0669]+", "", text)
     # A bullet dot glued to the first word is read as "\u0660" (Arabic zero), ":" or "."
     misread = re.match(r"^[\u0660\u06f0:.\u00b7\u2022]\s*(?=[\u0600-\u06ff])", text)
     if misread:
@@ -545,7 +588,7 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
             for ln in sorted(lines, key=lambda l: (round(l.y0 / 12), l.x0)):
                 bottom = ln.y1 * sy
                 if ln.rtl:
-                    token = f"QXR{len(placeholders):05d}Z"
+                    token = layout.placeholder(len(placeholders))
                     placeholders[token] = {"text": ln.text, "size": ln.size, "bold": False}
                     stats["ocr_bullets"] += ln.text.startswith("\u2022 ")
                     text, size = layout.fit_token(token, (ln.x1 - ln.x0) * sx, ln.size)
@@ -754,9 +797,13 @@ def _reflow(doc, default_size: float) -> int:
         if not lines:
             continue
         full: dict[float, int] = {}
+        count: Counter = Counter()
         for ln in lines:
             n = len(ln.text.strip())
             full[ln.size] = max(full.get(ln.size, 0), n)
+            count[ln.size] += 1
+        # rough line widths, for sizes too rare to have their own longest line
+        widest = max(len(ln.text.strip()) * ln.size for ln in lines)
 
         def joins(prev: _Line, cur_: _Line) -> bool:
             pt, ct = prev.text.strip(), cur_.text.strip()
@@ -767,8 +814,11 @@ def _reflow(doc, default_size: float) -> int:
             if cur_.first_in_para and (cur_.gap_before > max(3.0, 0.35 * cur_.size)
                                        or abs(cur_.indent - prev.indent) > 6):
                 return False
-            longest = max(1, full.get(prev.size, len(pt)))
-            prev_full = len(pt) >= 0.72 * longest
+            if count[prev.size] >= 3:
+                longest = max(1, full.get(prev.size, len(pt)))
+                prev_full = len(pt) >= 0.72 * longest
+            else:   # e.g. OCR'd English lines in an Arabic scan: compare with the whole group
+                prev_full = len(pt) * prev.size >= 0.72 * widest
             if pt[-1] in ".!?:\u061f" and not prev_full:   # incl. Arabic question mark
                 return False
             return prev_full
@@ -817,8 +867,9 @@ def _run_size(run, default: float) -> float:
 
 
 def _restart_numbering(doc, groups: list) -> None:
-    """Each numbered list starts at 1: its own numbering instance of the list style."""
-    if len(groups) < 2:
+    """Each numbered list counts from the number its source starts with ("1." for a new
+    list, "3." for one that continues after a note): its own numbering instance."""
+    if not groups or (len(groups) == 1 and groups[0][0] == 1):
         return
     try:
         numbering = doc.part.numbering_part.element
@@ -826,9 +877,11 @@ def _restart_numbering(doc, groups: list) -> None:
         abstract = next(n.abstractNumId.val for n in numbering.num_lst if n.numId == style_num)
     except Exception:
         return
-    for group in groups[1:]:
+    for k, (start, group) in enumerate(groups):
+        if k == 0 and start == 1:
+            continue                       # the list style already counts from 1
         num = numbering.add_num(abstract)
-        num.add_lvlOverride(ilvl=0).add_startOverride(1)
+        num.add_lvlOverride(ilvl=0).add_startOverride(start)
         for p in group:
             numpr = p._p.get_or_add_pPr().get_or_add_numPr()
             numpr.get_or_add_ilvl().val = 0
@@ -939,7 +992,11 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
         if mate is None or mate[1] != size or mate[0] is p:
             continue
         first, second = p.text.strip(), mate[0].text.strip()
-        if len(first.split()) >= 5 and len(second) <= len(first) and not first.endswith((".", ":", "\u061f", "?", "!")) \
+        gap = mate[0].paragraph_format.space_before
+        close = (gap.pt if gap is not None else 0.0) <= 0.6 * size
+        # right-to-left only: there pdf2docx leaves a wrapped title line as its own paragraph
+        if rtl and mate[2] and close and len(first.split()) >= 5 and len(second) <= len(first) \
+                and not first.endswith((".", ":", "\u061f", "?", "!")) \
                 and not _NUMBER.match(second) and not _BULLET.match(second):
             moved = list(mate[0]._p.iter(W + "r"))
             ts = [t for r in moved for t in r.iter(W + "t")]
@@ -977,17 +1034,23 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
 
     list_items = 0
     numbered_run: list = []
-    numbered_groups: list = []
+    numbered_groups: list = []          # (first number in the source, paragraphs)
+
+    def marker_value(p):
+        m = _NUMBER.match(p.text)
+        token = m.group(1) if m else ""
+        return int(token) if token.isdigit() else None
 
     def flush_numbered():
         nonlocal list_items
         if len(numbered_run) >= 2:
+            start = marker_value(numbered_run[0])
             for q in numbered_run:
                 freeze_look(q)
                 strip_marker(q, _NUMBER)
                 q.style = doc.styles["List Number"]
                 list_items += 1
-            numbered_groups.append(list(numbered_run))
+            numbered_groups.append((start or 1, list(numbered_run)))
         numbered_run.clear()
 
     for p in paras:
@@ -1004,6 +1067,9 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
                 p.paragraph_format.first_line_indent = None
             list_items += 1
         elif _NUMBER.match(p.text):
+            v, last = marker_value(p), marker_value(numbered_run[-1]) if numbered_run else None
+            if numbered_run and v is not None and last is not None and v != last + 1:
+                flush_numbered()           # "1. 2. 3." then "1. 2.": two lists
             numbered_run.append(p)
         else:
             flush_numbered()
@@ -1048,7 +1114,8 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
         # Running header/footer -> real Word header/footer (removed from the body first).
         bands = None
         try:
-            bands = layout.detect_bands(work, skip_pages=set() if stats["ocr"] else set(info.scanned_pages))
+            bands = layout.detect_bands(work, skip_pages=set() if stats["ocr"] else set(info.scanned_pages),
+                                        placeholders=placeholders)
         except Exception:
             log.exception("header/footer detection failed; converting without it")
         body_pdf = work

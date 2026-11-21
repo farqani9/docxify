@@ -90,7 +90,7 @@ def _filled_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
             if _coloured(d.get("fill")) and d["rect"].width > 4 and d["rect"].height > 4]
 
 
-def _page_items(page: pymupdf.Page) -> tuple[list[Item], list[tuple]]:
+def _page_items(page: pymupdf.Page, placeholders: Optional[dict] = None) -> tuple[list[Item], list[tuple]]:
     """Header/footer candidates, plus every content box on the page (obstacles)."""
     w, h = page.rect.width, page.rect.height
     drawings = page.get_drawings()
@@ -99,7 +99,7 @@ def _page_items(page: pymupdf.Page) -> tuple[list[Item], list[tuple]]:
     verticals = [d["rect"] for d in drawings if d["rect"].width <= 3 and d["rect"].height > 6]
     items: list[Item] = []
     obstacles: list[tuple] = []
-    glyphs = None
+    text_lines = []
     for b in page.get_text("dict")["blocks"]:
         if b["type"] == 1:
             x0, y0, x1, y1 = b["bbox"]
@@ -110,22 +110,34 @@ def _page_items(page: pymupdf.Page) -> tuple[list[Item], list[tuple]]:
         for line in b["lines"]:
             spans = [s for s in line["spans"] if s["text"]]
             text = "".join(s["text"] for s in spans)
-            if not text.strip():
-                continue
-            bbox = tuple(line["bbox"])
-            obstacles.append(bbox)
-            r = pymupdf.Rect(bbox)
-            if any(f.contains(r) for f in fills):   # text on a coloured cell = table, not header
-                continue
-            logical = ""
-            if _is_rtl(text):
-                glyphs = page_glyphs(page) if glyphs is None else glyphs
-                logical = " ".join(seg["text"] for seg in reversed(rtl_segments(glyphs, bbox, [], [])))
-            items.append(Item("text", bbox, key=("t", _norm(text), round(bbox[1] / 4)), spans=[
-                Span(s["text"], s["font"], s["size"], s["color"],
-                     bool(s["flags"] & 16) or "bold" in s["font"].lower(),
-                     bool(s["flags"] & 2) or "italic" in s["font"].lower() or "oblique" in s["font"].lower(),
-                     tuple(s["bbox"])) for s in spans], logical=logical))
+            if text.strip():
+                text_lines.append({"bbox": tuple(line["bbox"]), "spans": spans, "text": text})
+    glyphs, raw_lines, claimed = None, None, set()
+    for ln in _join_rtl_pieces(text_lines):
+        bbox, spans, text = ln["bbox"], ln["spans"], ln["text"]
+        obstacles.append(bbox)
+        r = pymupdf.Rect(bbox)
+        if any(f.contains(r) for f in fills):   # text on a coloured cell = table, not header
+            continue
+        logical = ""
+        token = PLACEHOLDER.fullmatch(text.strip()) if placeholders else None
+        if token:                            # an OCR'd right-to-left line: use its text
+            real = (placeholders.get(placeholder_key(token.group(0))) or {}).get("text", "")
+            if real:
+                s0 = dict(spans[0], text=real)
+                spans, text, logical = [s0], real, real
+        if _is_rtl(text) and not logical:
+            if glyphs is None:
+                glyphs = page_glyphs(page)
+                raw_lines = [(pymupdf.Rect(l["bbox"]), [(ch["c"], ch["bbox"]) for s in l["spans"] for ch in s["chars"]])
+                             for b in page.get_text("rawdict")["blocks"] if b["type"] == 0 for l in b["lines"]]
+            raw = [c for rb, chars in raw_lines if r.contains((rb.tl + rb.br) / 2) for c in chars]
+            logical = " ".join(seg["text"] for seg in reversed(rtl_segments(glyphs, bbox, raw, [], claimed)))
+        items.append(Item("text", bbox, key=("t", _norm(text), round(bbox[1] / 4)), spans=[
+            Span(s["text"], s["font"], s["size"], s["color"],
+                 bool(s["flags"] & 16) or "bold" in s["font"].lower(),
+                 bool(s["flags"] & 2) or "italic" in s["font"].lower() or "oblique" in s["font"].lower(),
+                 tuple(s["bbox"])) for s in spans], logical=logical))
 
     def table_border(r: pymupdf.Rect) -> bool:
         y = (r.y0 + r.y1) / 2
@@ -157,11 +169,39 @@ def _page_items(page: pymupdf.Page) -> tuple[list[Item], list[tuple]]:
     return items, obstacles
 
 
+def _join_rtl_pieces(lines: list[dict]) -> list[dict]:
+    """The extractor can cut one right-to-left line in two ("صفحة 1" | "من 3"):
+    rejoin touching pieces on the same row. Left-to-right lines are left alone."""
+    lines = sorted(lines, key=lambda l: (l["bbox"][1], l["bbox"][0]))
+    out: list[dict] = []
+    for ln in lines:
+        mate = None
+        for prev in reversed(out[-4:]):
+            a, c = prev["bbox"], ln["bbox"]
+            overlap = min(a[3], c[3]) - max(a[1], c[1])
+            if overlap < 0.7 * min(a[3] - a[1], c[3] - c[1]):
+                continue
+            size = max(s["size"] for s in prev["spans"] + ln["spans"])
+            gap = max(a[0], c[0]) - min(a[2], c[2])
+            if gap < 0.6 * size and (_is_rtl(prev["text"]) or _is_rtl(ln["text"])):
+                mate = prev
+                break
+        if mate is None:
+            out.append(dict(ln))
+            continue
+        a, c = mate["bbox"], ln["bbox"]
+        mate["bbox"] = (min(a[0], c[0]), min(a[1], c[1]), max(a[2], c[2]), max(a[3], c[3]))
+        mate["spans"] = sorted(mate["spans"] + ln["spans"], key=lambda s: s["bbox"][0])
+        mate["text"] = "".join(s["text"] for s in mate["spans"])
+    return out
+
+
 def _same_box(a: tuple, b: tuple, tol: float = 1.5) -> bool:
     return all(abs(x - y) <= tol for x, y in zip(a, b))
 
 
-def detect_bands(path: str | Path, skip_pages: Optional[set] = None) -> Optional[Bands]:
+def detect_bands(path: str | Path, skip_pages: Optional[set] = None,
+                 placeholders: Optional[dict] = None) -> Optional[Bands]:
     skip_pages = skip_pages or set()
     with pymupdf.open(path) as doc:
         n = doc.page_count
@@ -173,7 +213,7 @@ def detect_bands(path: str | Path, skip_pages: Optional[set] = None) -> Optional
         for page in doc:
             if page.number in skip_pages:
                 continue
-            per_page[page.number], obstacles[page.number] = _page_items(page)
+            per_page[page.number], obstacles[page.number] = _page_items(page, placeholders)
             sizes[(round(page.rect.width), round(page.rect.height))] += 1
         usable = len(per_page)
         if usable < 2:
@@ -230,15 +270,15 @@ def detect_bands(path: str | Path, skip_pages: Optional[set] = None) -> Optional
                 if same is not None:
                     seqs[pno] = [int(x) for x in re.findall(r"\d+", "".join(s.text for s in same.spans))]
             mine = seqs.get(ref, [])
-            roles = []
-            for k, val in enumerate(mine):
-                vals = {p: s[k] for p, s in seqs.items() if len(s) > k}
+            roles: list = [None] * len(mine)
+            columns = [{p: s[k] for p, s in seqs.items() if len(s) > k} for k in range(len(mine))]
+            for k, vals in enumerate(columns):
                 if len(vals) >= 2 and all(v == p + 1 for p, v in vals.items()):
-                    roles.append("PAGE")
-                elif len(vals) >= 2 and all(v == n for v in vals.values()) and "PAGE" in roles:
-                    roles.append("NUMPAGES")
-                else:
-                    roles.append(None)
+                    roles[k] = "PAGE"
+            if "PAGE" in roles:          # the total may come before the page number (RTL)
+                for k, vals in enumerate(columns):
+                    if roles[k] is None and len(vals) >= 2 and all(v == n for v in vals.values()):
+                        roles[k] = "NUMPAGES"
             it.digit_roles = roles
         return Bands(pages=n, page_size=sizes.most_common(1)[0][0], ref_page=ref,
                      header=sorted(tops.get(ref, []), key=lambda i: (i.bbox[1], i.bbox[0])),
@@ -300,6 +340,7 @@ def body_rules(path: str | Path, bands: Optional[Bands] = None) -> list[dict]:
             fills = [d["rect"] for d in drawings if d.get("fill") is not None and d["rect"].height > 4]
             lines = [l for b in page.get_text("dict")["blocks"] if b["type"] == 0 for l in b["lines"]
                      if "".join(s["text"] for s in l["spans"]).strip()]
+            glyphs = None
             seen = set()
             for d in drawings:
                 r = d["rect"]
@@ -320,14 +361,37 @@ def body_rules(path: str | Path, bands: Optional[Bands] = None) -> list[dict]:
                 if not above:
                     continue
                 ln = max(above, key=lambda l: l["bbox"][3])
+                text_above = "".join(s["text"] for s in ln["spans"])
+                if _is_rtl(text_above):          # extraction order differs from the DOCX text
+                    glyphs = page_glyphs(page) if glyphs is None else glyphs
+                    segs = rtl_segments(glyphs, tuple(ln["bbox"]), [], [])
+                    text_above = " ".join(seg["text"] for seg in reversed(segs)) or text_above
                 out.append({"page": page.number, "bbox": (r.x0, r.y0, r.x1, r.y1), "color": tuple(stroke),
                             "width": float(d.get("width") or max(0.5, r.height)),
                             "gap": max(0.0, y - ln["bbox"][3]),
-                            "text_above": "".join(s["text"] for s in ln["spans"])})
+                            "text_above": text_above})
     return out
 
 
 # ------------------------------------------------------------------ right-to-left
+# Placeholder tokens stand in for right-to-left lines during layout conversion:
+# "QXR" + index + "Z", then "Z" filler that stretches the token over the line's width.
+# Five digits keep tokens short enough for one-word lines (a token wider than its line
+# is drawn smaller, which changes how the layout converter groups lines); a sixth digit
+# is only used past 99,999 lines.
+PLACEHOLDER = re.compile(r"QXR\d{5,6}Z+")
+_KEY = re.compile(r"QXR\d{5,6}Z")
+
+
+def placeholder(index: int) -> str:
+    return f"QXR{index:05d}Z" if index < 100000 else f"QXR{index:06d}Z"
+
+
+def placeholder_key(token: str) -> str:
+    m = _KEY.match(token.strip())
+    return m.group(0) if m else token
+
+
 _RTL = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
 _MARK = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0591-\u05C7]")
 _LATIN = re.compile(r"[A-Za-z\u00C0-\u024F]")
@@ -624,7 +688,7 @@ def rewrite_rtl_lines(src: str | Path, dst: str | Path, start: int = 0,
     The layout converter mis-orders RTL text (and mixed RTL/LTR lines); with tokens
     it only has to place the lines, and docx_fix restores the logical text.
     Returns {token: {"text", "size", "bold"}}; writes nothing if there is no RTL text."""
-    mapping: dict[str, str] = {}
+    mapping: dict[str, dict] = {}
     skip_pages = skip_pages or set()
     with pymupdf.open(src) as doc:
         for page in doc:
@@ -659,7 +723,7 @@ def rewrite_rtl_lines(src: str | Path, dst: str | Path, start: int = 0,
                     jobs.append({"bbox": pymupdf.Rect(seg["x0"], lb[1], seg["x1"], lb[3]),
                                  "text": seg["text"], "size": round(max(s["size"] for s in spans) * 2) / 2,
                                  "color": main["color"], "bold": n_bold > n_all / 2,
-                                 "baseline": main["origin"][1]})
+                                 "baseline": main["origin"][1], "font": main["font"]})
             if not jobs:
                 continue
             for j in jobs:
@@ -677,8 +741,8 @@ def rewrite_rtl_lines(src: str | Path, dst: str | Path, start: int = 0,
                                       graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
                                       text=pymupdf.PDF_REDACT_TEXT_NONE)
             for j in jobs:
-                token = f"QXR{start + len(mapping):05d}Z"
-                mapping[token] = {"text": j["text"], "size": j["size"], "bold": j["bold"]}
+                token = placeholder(start + len(mapping))
+                mapping[token] = {"text": j["text"], "size": j["size"], "bold": j["bold"], "font": j["font"]}
                 font = "hebo" if j["bold"] else "helv"
                 text, size = fit_token(token, j["bbox"].width, j["size"], font)
                 c = j["color"]
