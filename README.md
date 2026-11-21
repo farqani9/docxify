@@ -5,15 +5,14 @@
 [![CI](https://github.com/farqani9/docxify/actions/workflows/ci.yml/badge.svg)](https://github.com/farqani9/docxify/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776ab.svg)
-![Release 1.0](https://img.shields.io/badge/release-1.0-informational.svg)
+![Release 1.1](https://img.shields.io/badge/release-1.1-informational.svg)
 
 Docxify is a self-hosted PDF → DOCX converter with built-in OCR. Drop in a PDF and get back
 a Word document you can actually edit: real headings, paragraphs that reflow, bulleted lists,
 tables, and a proper header and footer. Files never leave your machine.
 
-> **Current release: 1.0.** Version **1.1**, in development on the `feature/arabic-ocr`
-> branch, adds Arabic OCR and right-to-left documents. Features marked *(1.1)* below are
-> part of it. See [Versions](#versions).
+> **Current release: 1.1**, which adds Arabic OCR and right-to-left documents. Features
+> marked *(1.1)* below are new in it. See [Versions](#versions).
 
 ![Docxify: files and conversion options](docs/app-options.png)
 
@@ -186,9 +185,7 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Versions
 
-### 1.1 (next version, in development)
-
-On the `feature/arabic-ocr` branch, not merged into `main` yet.
+### 1.1 (current release, 2026-11-21)
 
 New:
 
@@ -224,9 +221,9 @@ by `tests/check_engine.py`. A real five-page Arabic proposal, which isn't in the
 converts page for page with the same structure, header and footer. Known gaps are listed
 under [Limitations](#limitations).
 
-### 1.0 (current release)
+### 1.0 (2026-11-21)
 
-The first public release, on `main`:
+The first public release, tagged [`v1.0`](https://github.com/farqani9/docxify/tree/v1.0):
 
 - PDF to DOCX conversion with layout preserved (pdf2docx), cleaned up into a Word-native
   file: heading styles, reflowed paragraphs, bulleted and numbered lists, tables rejoined
