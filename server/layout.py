@@ -309,3 +309,130 @@ def body_rules(path: str | Path, bands: Optional[Bands] = None) -> list[dict]:
                             "gap": max(0.0, y - ln["bbox"][3]),
                             "text_above": "".join(s["text"] for s in ln["spans"])})
     return out
+
+
+# ------------------------------------------------------------------ right-to-left
+_RTL = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
+_LATIN = re.compile(r"[A-Za-z\u00C0-\u024F]")
+
+
+def _is_rtl(text: str) -> bool:
+    r = len(_RTL.findall(text))
+    return r > 0 and r >= len(_LATIN.findall(text))
+
+
+def _logical_from_visual(visual: str) -> str:
+    from bidi.algorithm import get_display
+    return re.sub(r"\s+", " ", get_display(visual, base_dir="R")).strip()
+
+
+def logical_from_chars(chars: list) -> str:
+    """Reading-order text of one RTL line from positioned characters [(c, bbox), ...].
+
+    Characters sorted by x give the true visual order (independent of any reordering
+    done by the PDF text extractor); the Unicode bidi algorithm with a right-to-left
+    base direction turns that back into logical order. Diacritics are kept with their
+    base letter; spaces are added where the PDF positions words apart without one."""
+    import unicodedata
+
+    bases, marks = [], []
+    for c, bb in chars:
+        if not c:
+            continue
+        cx = (bb[0] + bb[2]) / 2
+        (marks if unicodedata.category(c[0]) == "Mn" else bases).append((cx, c, bb))
+    if not bases:
+        return ""
+    bases.sort(key=lambda t: t[0])
+    attached: dict[int, list] = {}
+    for cx, c, _bb in marks:
+        k = min(range(len(bases)), key=lambda i: abs(bases[i][0] - cx))
+        attached.setdefault(k, []).append(c)
+    visual, prev = [], None
+    for i, (cx, c, bb) in enumerate(bases):
+        if prev is not None and c != " " and visual and visual[-1] != " ":
+            size = max(1.0, bb[3] - bb[1])
+            if bb[0] - prev[2] > 0.2 * size:
+                visual.append(" ")
+        logical = unicodedata.normalize("NFKC", c) if _RTL.search(c) else c
+        # a ligature glyph (e.g. lam-alef) decomposes to logical order; store it visually
+        visual.extend(attached.get(i, []))
+        visual.append(logical[::-1] if len(logical) > 1 and _RTL.search(logical) else logical)
+        prev = bb
+    return _logical_from_visual("".join(visual))
+
+
+def logical_line_text(spans: list) -> str:
+    """Span-level variant (header/footer items): RTL spans arrive logically ordered."""
+    import unicodedata
+
+    visual = ""
+    for s in sorted((s for s in spans if s.get("text")), key=lambda s: s["bbox"][0]):
+        t = unicodedata.normalize("NFKC", s["text"])
+        visual += t[::-1] if _RTL.search(t) else t
+    return _logical_from_visual(visual)
+
+
+def fit_token(token: str, width: float, size: float, font: str = "helv") -> tuple[str, float]:
+    """Placeholder text and font size that cover ``width`` without stretching glyphs
+    (a stretched font matrix would be reported as a bigger font size)."""
+    natural = pymupdf.get_text_length(token, fontname=font, fontsize=size)
+    if natural >= width:
+        return token, max(2.0, size * width / natural) if natural else size
+    filler = pymupdf.get_text_length("Z", fontname=font, fontsize=size)
+    return token + "Z" * min(200, int((width - natural) / filler)), size
+
+
+def rewrite_rtl_lines(src: str | Path, dst: str | Path, start: int = 0,
+                      skip_pages: Optional[set] = None) -> dict:
+    """Replace every right-to-left text line by a placeholder token over the same box.
+
+    The layout converter mis-orders RTL text (and mixed RTL/LTR lines); with tokens
+    it only has to place the lines, and docx_fix restores the logical text.
+    Returns {token: {"text", "size", "bold"}}; writes nothing if there is no RTL text."""
+    mapping: dict[str, str] = {}
+    skip_pages = skip_pages or set()
+    with pymupdf.open(src) as doc:
+        for page in doc:
+            if page.number in skip_pages or not _RTL.search(page.get_text()):
+                continue                     # cheap pre-check: most pages have no RTL text
+            jobs = []
+            for b in page.get_text("rawdict")["blocks"]:
+                if b["type"] != 0:
+                    continue
+                for line in b["lines"]:
+                    spans = [s for s in line["spans"] if s["chars"]]
+                    raw = "".join(ch["c"] for s in spans for ch in s["chars"])
+                    if not spans or not _is_rtl(raw):
+                        continue
+                    text = logical_from_chars([(ch["c"], ch["bbox"]) for s in spans for ch in s["chars"]])
+                    if not text:
+                        continue
+                    main = max(spans, key=lambda s: len(s["chars"]))
+                    n_all = sum(len(s["chars"]) for s in spans)
+                    n_bold = sum(len(s["chars"]) for s in spans if s["flags"] & 16 or "bold" in s["font"].lower())
+                    jobs.append({"bbox": pymupdf.Rect(line["bbox"]), "text": text,
+                                 "size": round(max(s["size"] for s in spans) * 2) / 2,
+                                 "color": main["color"], "bold": n_bold > n_all / 2,
+                                 "baseline": main["origin"][1]})
+            if not jobs:
+                continue
+            for j in jobs:
+                r = j["bbox"]
+                mid = (r.y0 + r.y1) / 2
+                band = max(1.0, 0.25 * (r.y1 - r.y0))   # only this line's glyphs
+                page.add_redact_annot(pymupdf.Rect(r.x0, mid - band, r.x1, mid + band), fill=False)
+            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                                  graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                                  text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+            for j in jobs:
+                token = f"QXR{start + len(mapping):05d}Z"
+                mapping[token] = {"text": j["text"], "size": j["size"], "bold": j["bold"]}
+                font = "hebo" if j["bold"] else "helv"
+                text, size = fit_token(token, j["bbox"].width, j["size"], font)
+                c = j["color"]
+                page.insert_text((j["bbox"].x0, j["baseline"]), text, fontname=font, fontsize=size,
+                                 color=((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255))
+        if mapping:
+            doc.save(dst, garbage=3, deflate=True)
+    return mapping

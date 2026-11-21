@@ -16,8 +16,11 @@ tables, and a proper header and footer. Files never leave your machine.
 
 - **Layout-faithful conversion** of text PDFs: fonts, tables, images and spacing.
 - **Built-in OCR** for scanned PDFs (PP-OCRv5 via RapidOCR). It straightens pages, recognizes
-  the text, rebuilds tables from their ruling lines and recovers bullet points. English and
-  other Latin-script languages are supported.
+  the text, rebuilds tables from their ruling lines and recovers bullet points. Supported
+  languages: English, other Latin-script languages, and Arabic.
+- **Arabic and right-to-left text**, from scans and from digital PDFs. Paragraphs come out
+  right to left in Word, in correct reading order, with numbers and Latin words such as
+  "pH" kept in place.
 - **Automatic scan detection.** Docxify spots image-only pages and offers OCR when it would
   help.
 - **Word-native output:**
@@ -57,6 +60,18 @@ go into Word as images. With OCR you get editable text:
 
 ![A scanned page and the editable Word document produced from it](docs/ocr-example.png)
 
+## Arabic documents
+
+Digital Arabic PDFs need no setting: right-to-left lines are found automatically. For a
+scanned Arabic PDF, turn on OCR and pick **Arabic (العربية)** as the text language (API:
+`ocr_lang=ar`).
+
+The Arabic OCR model reads Arabic well but drops digits and Latin letters, so each Arabic
+line is re-read word by word with both the Arabic and the English model, and the better
+reading is kept for each word. In Word, paragraphs, runs and the section are marked
+right to left, and Arabic text uses complex-script fonts and sizes (Arial or Times New
+Roman), so it displays correctly in Word, Pages and LibreOffice.
+
 ## How it works
 
 1. **Upload.** Files are sent in 2 MB chunks. Each page is checked: pages with almost no
@@ -64,8 +79,12 @@ go into Word as images. With OCR you get editable text:
 2. **OCR (optional, for scanned pages).** Each page is rendered at 200 dpi and deskewed,
    then its text is recognized. Each page is rebuilt as a clean text page: ink-tight line
    positions, clustered font sizes, recovered bullets and redrawn table rules.
+   Right-to-left lines are written as placeholders sized to the original line, so the
+   layout step can't reorder their characters.
 3. **Layout conversion.** [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) turns the
-   pages into DOCX. Running headers and footers are detected and stripped first.
+   pages into DOCX. Running headers and footers are detected and stripped first. In
+   digital PDFs, right-to-left lines get the same placeholder treatment, with their
+   reading order recovered from glyph positions by the Unicode bidi algorithm.
 4. **Clean-up** (`server/docx_fix.py`), so the file behaves like one made in Word:
    - map fonts to installed equivalents;
    - merge the page sections into one flow;
@@ -75,6 +94,7 @@ go into Word as images. With OCR you get editable text:
    - split bullet lists into separate items;
    - restore free-standing rules and letter spacing;
    - rebuild the header and footer;
+   - put right-to-left text back in place of its placeholders and mark it right to left;
    - make all values valid OOXML.
 5. **Semantics** (`server/engine.py`). Wrapped lines are rejoined into paragraphs, Heading
    1–3 styles come from font-size ranks, list styles are applied, and the document title is
@@ -97,7 +117,7 @@ curl -o report.docx localhost:8000/v1/download/$TASK
 |---|---|---|
 | `POST` | `/v1/start` | Creates a task, returning `{task, limits, ocr_languages}` |
 | `POST` | `/v1/upload` | Multipart: `task`, `file`, plus optional `uid`, `name`, `chunk`, `chunks` for chunked uploads. Returns `{server_filename, scanned, pages, scanned_pages, thumbnail}` |
-| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin`, `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
+| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin\|ar`, `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
 | `GET` | `/v1/task/{task}` | Status and progress `{stage, file, files, done, total, percent}` |
 | `GET` | `/v1/download/{task}` | The `.docx`, or a `.zip` for several files |
 | `GET` | `/v1/thumbnail/{task}/{file}` | First-page preview (PNG) |
@@ -125,7 +145,7 @@ before exposing it to a network.
 ## Development
 
 ```bash
-.venv/bin/python tests/make_fixtures.py     # generate synthetic digital + scanned PDFs
+.venv/bin/python tests/make_fixtures.py     # generate synthetic PDFs (English + Arabic)
 .venv/bin/python tests/check_engine.py      # structure, layout and OCR-accuracy checks
 .venv/bin/python tests/check_feedback.py    # re-check your private cases in feedback/
 npm install && npx playwright install chromium
@@ -148,7 +168,11 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - Bold and italic aren't recovered from scans. Headings are still detected, from font size.
 - Images inside scanned pages are dropped in OCR mode, which keeps only text and tables.
-- Multi-column scans, handwriting and right-to-left scripts aren't supported yet.
+- Multi-column scans and handwriting aren't supported yet.
+- Among right-to-left scripts, OCR covers Arabic only. Digital Hebrew, Persian or Urdu PDFs
+  get right-to-left paragraphs, but they're less tested.
+- On Arabic scans, font sizes are estimated from line width and height, so a heading only
+  slightly larger than body text can be missed.
 - Layout fidelity on complex digital PDFs depends on pdf2docx, and very dense layouts may
   need touch-ups.
 
@@ -166,5 +190,6 @@ It's built on these projects:
 | [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) | MIT |
 | [RapidOCR](https://github.com/RapidAI/RapidOCR) and the PaddleOCR PP-OCR models | Apache-2.0 |
 | [python-docx](https://github.com/python-openxml/python-docx) | MIT |
+| [python-bidi](https://github.com/MeirKriheli/python-bidi) | LGPL-3.0 |
 | [OpenCV](https://opencv.org/), [ONNX Runtime](https://onnxruntime.ai/) | Apache-2.0 / MIT |
 | [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/) | MIT / BSD-3-Clause |

@@ -3,6 +3,10 @@
 - digital.pdf : two pages with a real text layer (headings, styled runs, list, table)
 - scanned.pdf : the same pages rasterised at 150 dpi with a slight skew and
                 noise, saved as image-only pages (no text layer) -> needs OCR
+- arabic_digital.pdf : a right-to-left Arabic page with a text layer, mixed with
+                numbers and Latin ("pH")
+- arabic_scanned.pdf : a shaped Arabic page (headings, list, table) scanned the
+                same way -> needs OCR with lang="ar"
 """
 from pathlib import Path
 
@@ -135,10 +139,100 @@ def make_scanned(src, path, dpi=150, seed=7):
     out.save(path, deflate=True)
 
 
+# ----------------------------------------------------------------- Arabic
+AR_TITLE = "تقرير ميداني ربع سنوي"
+AR_SUBTITLE = "إعداد فريق الرصد - مايو 2026"
+AR_BODY = ("يلخص هذا التقرير نتائج المسح الربيعي. تحسنت جودة المياه في معظم مواقع أخذ العينات، "
+           "بينما لا تزال محطتان في الشمال تسجلان عكارة مرتفعة بعد الأمطار الغزيرة في أبريل.")
+AR_HEADINGS = ["أرقام رئيسية", "ملخص المحطات"]
+AR_BULLETS = ["عدد المواقع التي تمت زيارتها: 14", "متوسط الأكسجين المذاب: 8.2 ملغم/لتر",
+              "محطات تحتاج إلى متابعة: 2"]
+AR_TABLE = [["المحطة", "الرقم الهيدروجيني (pH)", "الحالة"],
+            ["الشمالية 1", "7.1", "مراجعة"],
+            ["الشمالية 2", "7.3", "مراجعة"],
+            ["الوسطى", "7.6", "جيدة"]]
+AR_MIXED = "قيمة pH في المحطة الشمالية 7.1 خلال شهر مايو 2026"
+
+AR_CSS = ("body { font-size: 12pt; } h1 { font-size: 22pt; margin: 0 0 4pt 0; } "
+          "h2 { font-size: 15pt; margin: 14pt 0 6pt 0; } p { margin: 0 0 6pt 0; } "
+          ".sub { font-size: 10pt; color: #555; } "
+          "table { border-collapse: collapse; width: 100%; } "
+          "td, th { border: 1px solid #777; padding: 4px 8px; } th { background: #eee; }")
+
+
+def make_arabic_source(path):
+    """Properly shaped right-to-left Arabic page (rendered by MuPDF's HTML engine
+    with its built-in Noto Naskh Arabic). Used as the source of the scanned fixture."""
+    rows = "".join("<tr>" + "".join(f"<{'th' if i == 0 else 'td'}>{c}</{'th' if i == 0 else 'td'}>"
+                                    for c in row) + "</tr>" for i, row in enumerate(AR_TABLE))
+    bullets = "".join(f"<p>• {b}</p>" for b in AR_BULLETS)
+    html = (f'<div dir="rtl"><h1>{AR_TITLE}</h1><p class="sub">{AR_SUBTITLE}</p><p>{AR_BODY}</p>'
+            f"<h2>{AR_HEADINGS[0]}</h2>{bullets}<h2>{AR_HEADINGS[1]}</h2><table>{rows}</table>"
+            f"<p>{AR_MIXED}</p></div>")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_htmlbox(pymupdf.Rect(64, 64, 531, 800), html, css=AR_CSS)
+    doc.save(path)
+
+
+def make_arabic_digital(path):
+    """Arabic page with a correct text layer. Glyphs are stored in visual order,
+    like real PDFs; Latin runs use Helvetica. (Glyphs are unshaped: the text layer,
+    not the look, is what this fixture tests.)"""
+    import re
+    from bidi.algorithm import get_display
+
+    arabic = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+    arfont = pymupdf.Font(script=6)   # built-in Noto Naskh Arabic
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_font(fontname="noar", fontbuffer=arfont.buffer)
+
+    def width(kind, t, size):
+        return arfont.text_length(t, fontsize=size) if kind == "ar" else \
+            pymupdf.get_text_length(t, fontname="helv", fontsize=size)
+
+    def line(text, y, size, right=531):
+        runs = []
+        for ch in get_display(text):
+            kind = "ar" if arabic.match(ch) or (ch == " " and runs and runs[-1][0] == "ar") else "lat"
+            if runs and runs[-1][0] == kind:
+                runs[-1][1] += ch
+            else:
+                runs.append([kind, ch])
+        x = right - sum(width(k, t, size) for k, t in runs)
+        for k, t in runs:
+            page.insert_text((x, y), t, fontname="noar" if k == "ar" else "helv", fontsize=size)
+            x += width(k, t, size)
+
+    y = 90
+    line(AR_TITLE, y, 22)
+    y += 30
+    line(AR_SUBTITLE, y, 10)
+    y += 34
+    for part in (AR_BODY[:AR_BODY.index("،") + 1], AR_BODY[AR_BODY.index("،") + 2:]):
+        line(part, y, 12)
+        y += 18
+    y += 14
+    line(AR_HEADINGS[0], y, 15)
+    y += 24
+    for b in AR_BULLETS:
+        line("• " + b, y, 12)
+        y += 18
+    y += 10
+    line(AR_MIXED, y, 12)
+    doc.set_metadata({"title": AR_TITLE, "author": "Synthetic fixture"})
+    doc.save(path)
+
+
 if __name__ == "__main__":
     make_digital(OUT / "digital.pdf")
     make_scanned(OUT / "digital.pdf", OUT / "scanned.pdf")
-    for name in ("digital.pdf", "scanned.pdf"):
+    make_arabic_source(OUT / "_arabic_source.pdf")
+    make_scanned(OUT / "_arabic_source.pdf", OUT / "arabic_scanned.pdf", seed=11)
+    (OUT / "_arabic_source.pdf").unlink()
+    make_arabic_digital(OUT / "arabic_digital.pdf")
+    for name in ("digital.pdf", "scanned.pdf", "arabic_scanned.pdf", "arabic_digital.pdf"):
         d = pymupdf.open(OUT / name)
         chars = sum(len(p.get_text().strip()) for p in d)
         print(f"{name}: {d.page_count} pages, {chars} extractable chars, "

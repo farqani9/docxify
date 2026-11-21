@@ -73,6 +73,27 @@ const assert = (cond, msg) => { if (!cond) throw new Error('ASSERT: ' + msg); co
   await page.waitForSelector('#view-select.is-active');
   assert(true, 'delete-now returned to start');
 
+  // 3) Arabic scan: OCR + Arabic chosen up front -> the job carries ocr_lang=ar
+  let processBody = '';
+  page.on('request', (r) => { if (r.url().endsWith('/v1/process')) processBody = r.postData() || ''; });
+  await page.setInputFiles('#file-input', path.join(FIX, 'arabic_scanned.pdf'));
+  await page.waitForSelector('.file-card .badge:not([hidden])', { timeout: 30000 });
+  await page.check('input[name=ocr][value="1"]', { force: true });
+  await page.selectOption('#lang', 'ar');
+  assert((await page.textContent('#lang option[value="ar"]')).includes('العربية'), 'Arabic offered as a text language');
+  await page.waitForTimeout(250); // option cards fade to their checked state
+  await page.screenshot({ path: path.join(outDir, '6_arabic_options.png') });
+  await page.click('#convert');
+  await page.waitForSelector('#view-done.is-active', { timeout: 120000 });
+  assert(/name="ocr_lang"\r?\n\r?\nar\r?\n/.test(processBody), 'Arabic OCR language sent with the job');
+  assert(/1 pages? recognized/.test(await page.textContent('#summary')), 'summary reports OCR on the Arabic page');
+  const [dlAr] = await Promise.all([page.waitForEvent('download'), page.click('#download')]);
+  const docxAr = path.join(outDir, 'ui_arabic.docx');
+  await dlAr.saveAs(docxAr);
+  assert(fs.statSync(docxAr).size > 5000, 'Arabic DOCX downloaded');
+  await page.click('#delete-now');
+  await page.waitForSelector('#view-select.is-active');
+
   // 3) mobile layout
   const m = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, hasTouch: true });
   const mp = await m.newPage();

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import io
 import re
+import unicodedata
 from typing import Optional
 
 from docx import Document
@@ -38,7 +39,62 @@ _FONT_PREFIXES = [
     ("arialnarrow", "Arial Narrow"), ("arial", "Arial"),
     ("timesnewroman", "Times New Roman"), ("times", "Times New Roman"),
     ("couriernew", "Courier New"), ("courier", "Courier New"),
+    # Arabic: Naskh styles -> Times New Roman (Naskh Arabic glyphs), sans -> Arial
+    ("notonaskharabic", "Times New Roman"), ("amiri", "Times New Roman"),
+    ("scheherazade", "Times New Roman"), ("notosansarabic", "Arial"), ("notokufiarabic", "Arial"),
 ]
+
+# Placeholder tokens written by the OCR step for right-to-left lines.
+PLACEHOLDER = re.compile(r"QXR\d{5}Z+")
+_RTL_CHARS = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
+_LTR_LETTERS = re.compile(r"[A-Za-z\u00C0-\u024F]")
+_ARABIC_FORMS = re.compile(r"[\uFB50-\uFDFF\uFE70-\uFEFC]+")
+
+
+def is_rtl(text: str) -> bool:
+    """True when right-to-left letters (Arabic, Hebrew) dominate the text."""
+    r = len(_RTL_CHARS.findall(text))
+    return r > 0 and r >= len(_LTR_LETTERS.findall(text))
+
+
+# Child order required by the OOXML schema (Word rejects out-of-order elements).
+_SEQ = {
+    "pPr": ("pStyle keepNext keepLines pageBreakBefore framePr widowControl numPr "
+            "suppressLineNumbers pBdr shd tabs suppressAutoHyphens kinsoku wordWrap overflowPunct "
+            "topLinePunct autoSpaceDE autoSpaceDN bidi adjustRightInd snapToGrid spacing ind "
+            "contextualSpacing mirrorIndents suppressOverlap jc textDirection textAlignment "
+            "textboxTightWrap outlineLvl divId cnfStyle rPr sectPr pPrChange").split(),
+    "rPr": ("rStyle rFonts b bCs i iCs caps smallCaps strike dstrike outline shadow emboss imprint "
+            "noProof snapToGrid vanish webHidden color spacing w kern position sz szCs highlight u "
+            "effect bdr shd fitText vertAlign rtl cs em lang eastAsianLayout specVanish oMath").split(),
+    "tblPr": ("tblStyle tblpPr tblOverlap bidiVisual tblStyleRowBandSize tblStyleColBandSize tblW jc "
+              "tblCellSpacing tblInd tblBorders shd tblLayout tblCellMar tblLook tblCaption "
+              "tblDescription tblPrChange").split(),
+    "sectPr": ("headerReference footerReference footnotePr endnotePr type pgSz pgMar paperSrc "
+               "pgBorders lnNumType pgNumType cols formProt vAlign noEndnote titlePg textDirection "
+               "bidi rtlGutter docGrid printerSettings sectPrChange").split(),
+}
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _ordered_child(parent, name: str):
+    """Return parent's child ``w:name``, creating it at its schema position."""
+    existing = parent.find(W + name)
+    if existing is not None:
+        return existing
+    seq = _SEQ[_local(parent.tag)]
+    rank = seq.index(name)
+    el = OxmlElement(f"w:{name}")
+    for i, child in enumerate(parent):
+        ln = _local(child.tag)
+        if ln in seq and seq.index(ln) > rank:
+            parent.insert(i, el)
+            return el
+    parent.append(el)
+    return el
 _BULLETS = "•·▪●◦‣⁃∙–-*"
 
 
@@ -353,10 +409,7 @@ def fix_bullets(doc) -> int:
                 if ppr is None:
                     ppr = OxmlElement("w:pPr")
                     p.insert(0, ppr)
-                ind = ppr.find(W + "ind")
-                if ind is None:
-                    ind = OxmlElement("w:ind")
-                    ppr.append(ind)
+                ind = _ordered_child(ppr, "ind")
                 left = int(float(ind.get(W + "left") or ind.get(W + "start") or 0))
                 stops = [int(float(t.get(W + "pos"))) for t in ppr.iter(W + "tab") if t.get(W + "pos")]
                 text_pos = min([s for s in stops if s > left + 60], default=left + 230)
@@ -428,10 +481,7 @@ def zero_cell_vertical_margins(doc) -> int:
     """Word's default top/bottom cell margin is 0, Pages adds its own unless told."""
     n = 0
     for tblpr in doc.element.body.iter(W + "tblPr"):
-        mar = tblpr.find(W + "tblCellMar")
-        if mar is None:
-            mar = OxmlElement("w:tblCellMar")
-            tblpr.append(mar)
+        mar = _ordered_child(tblpr, "tblCellMar")
         for side in ("top", "bottom"):
             if mar.find(W + side) is None:
                 el = OxmlElement(f"w:{side}")
@@ -463,7 +513,7 @@ def restore_letter_spacing(doc) -> int:
         runs = [r for r in p.iterchildren(W + "r") if r.find(W + "t") is not None]
         texts = [r.find(W + "t").text or "" for r in runs]
         singles = [r for r, t in zip(runs, texts) if len(t.strip()) == 1]
-        if len(runs) < 8 or len(singles) / len(runs) < 0.7:
+        if len(runs) < 8 or len(singles) / len(runs) < 0.7 or is_rtl("".join(texts)):
             continue
         for r in runs:
             rpr = r.find(W + "rPr")
@@ -472,10 +522,7 @@ def restore_letter_spacing(doc) -> int:
                 r.insert(0, rpr)
             sz = rpr.find(W + "sz")
             size_pt = int(sz.get(W + "val")) / 2 if sz is not None and (sz.get(W + "val") or "").isdigit() else 10
-            sp = rpr.find(W + "spacing")
-            if sp is None:
-                sp = OxmlElement("w:spacing")
-                rpr.append(sp)
+            sp = _ordered_child(rpr, "spacing")
             sp.set(W + "val", str(round(size_pt * 0.3 * 20)))   # twentieths of a point
         fixed += 1
     return fixed
@@ -484,10 +531,7 @@ def restore_letter_spacing(doc) -> int:
 # ------------------------------------------------------------------ header / footer
 def _set_border(paragraph, side: str, rule: layout.Item, gap_pt: float) -> None:
     ppr = paragraph._p.get_or_add_pPr()
-    bdr = ppr.find(W + "pBdr")
-    if bdr is None:
-        bdr = OxmlElement("w:pBdr")
-        ppr.append(bdr)
+    bdr = _ordered_child(ppr, "pBdr")
     el = OxmlElement(f"w:{side}")
     el.set(qn("w:val"), "single")
     el.set(qn("w:sz"), str(max(2, min(96, round(rule.width * 8)))))
@@ -599,6 +643,11 @@ def _build_band(container, items: list, page_w: float, left: float, right: float
                     if png:
                         p.add_run().add_picture(io.BytesIO(png), width=Pt(it.bbox[2] - it.bbox[0]))
                     continue
+                if layout._is_rtl("".join(s.text for s in it.spans)):
+                    main = max(it.spans, key=lambda s: len(s.text.strip()))
+                    _text_run(p, layout.logical_line_text(
+                        [{"bbox": s.bbox, "text": s.text} for s in it.spans]), main)
+                    continue
                 roles = list(it.digit_roles)
                 k = 0
                 for span in it.spans:
@@ -666,8 +715,130 @@ def apply_body_rules(doc, rules: list) -> int:
     return applied
 
 
+# ------------------------------------------------------------------ right-to-left
+def _parts(doc) -> list:
+    """Body plus every header/footer part that exists."""
+    roots = [doc.element.body]
+    for sec in doc.sections:
+        for hf in (sec.header, sec.footer):
+            if not hf.is_linked_to_previous:
+                roots.append(hf._element)
+    return roots
+
+
+def substitute_placeholders(doc, mapping: dict) -> int:
+    """Swap placeholder tokens for the logical-order text, with the intended font
+    size and weight (the token itself was sized only to cover the right width)."""
+    if not mapping:
+        return 0
+
+    def entry(tok: str) -> dict:
+        e = mapping.get(tok[:9], {"text": ""})
+        return e if isinstance(e, dict) else {"text": e}
+
+    def style_run(r, e: dict) -> None:
+        rpr = r.find(W + "rPr")
+        if rpr is None:
+            rpr = OxmlElement("w:rPr")
+            r.insert(0, rpr)
+        if e.get("size"):
+            v = str(round(float(e["size"]) * 2))
+            _ordered_child(rpr, "sz").set(W + "val", v)
+            _ordered_child(rpr, "szCs").set(W + "val", v)
+        if "bold" in e:
+            for tag in ("b", "bCs"):
+                el = _ordered_child(rpr, tag)
+                if not e["bold"]:
+                    el.set(W + "val", "0")
+
+    n = 0
+    for root in _parts(doc):
+        for t in list(root.iter(W + "t")):
+            if t.text and PLACEHOLDER.search(t.text):
+                toks = PLACEHOLDER.findall(t.text)
+                t.text = PLACEHOLDER.sub(lambda m: entry(m.group(0))["text"], t.text)
+                t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                run = t.getparent()
+                if run is not None and run.tag == W + "r":
+                    style_run(run, entry(toks[0]))
+                n += 1
+        for p in root.iter(W + "p"):   # a token split across runs
+            ts = list(p.iter(W + "t"))
+            full = "".join(x.text or "" for x in ts)
+            if PLACEHOLDER.search(full):
+                tok = PLACEHOLDER.search(full).group(0)
+                ts[0].text = PLACEHOLDER.sub(lambda m: entry(m.group(0))["text"], full)
+                for x in ts[1:]:
+                    x.text = ""
+                if ts[0].getparent() is not None and ts[0].getparent().tag == W + "r":
+                    style_run(ts[0].getparent(), entry(tok))
+                n += 1
+    return n
+
+
+def normalize_arabic_forms(doc) -> int:
+    """Presentation forms (shaped glyph code points from PDF text layers) -> letters."""
+    n = 0
+    for root in _parts(doc):
+        for t in root.iter(W + "t"):
+            if t.text and _ARABIC_FORMS.search(t.text):
+                t.text = _ARABIC_FORMS.sub(lambda m: unicodedata.normalize("NFKC", m.group(0)), t.text)
+                n += 1
+    return n
+
+
+def fix_rtl(doc) -> dict:
+    """Mark right-to-left paragraphs and runs the way Word expects for Arabic."""
+    paras = rtl = 0
+    for root in _parts(doc):
+        for p in root.iter(W + "p"):
+            text = "".join(t.text or "" for t in p.iter(W + "t"))
+            if not text.strip():
+                continue
+            paras += 1
+            if not is_rtl(text):
+                continue
+            rtl += 1
+            ppr = p.find(W + "pPr")
+            if ppr is None:
+                ppr = OxmlElement("w:pPr")
+                p.insert(0, ppr)
+            _ordered_child(ppr, "bidi")
+            jc = ppr.find(W + "jc")
+            if jc is not None and jc.get(W + "val") in ("left", "right", "start", "end"):
+                ppr.remove(jc)            # bidi paragraphs default to right alignment
+            ind = ppr.find(W + "ind")
+            if ind is not None:           # PDF left offsets are meaningless once mirrored
+                ppr.remove(ind)
+            for r in p.iter(W + "r"):
+                rt = "".join(t.text or "" for t in r.findall(W + "t"))
+                if not rt:
+                    continue
+                rpr = r.find(W + "rPr")
+                if rpr is None:
+                    rpr = OxmlElement("w:rPr")
+                    r.insert(0, rpr)
+                fonts = _ordered_child(rpr, "rFonts")
+                base = map_font(fonts.get(W + "ascii") or "") or ""
+                fonts.set(W + "cs", base if base in ("Arial", "Times New Roman") else "Arial")
+                sz = rpr.find(W + "sz")
+                if sz is not None and sz.get(W + "val"):
+                    _ordered_child(rpr, "szCs").set(W + "val", sz.get(W + "val"))
+                b = rpr.find(W + "b")
+                if b is not None and b.get(W + "val", "true") not in ("0", "false"):
+                    _ordered_child(rpr, "bCs")
+                if _RTL_CHARS.search(rt):
+                    _ordered_child(rpr, "rtl")
+                    _ordered_child(rpr, "lang").set(W + "bidi", "ar-SA")
+    if paras and rtl / paras >= 0.5:      # mostly RTL: right-to-left page layout
+        for sect in doc.element.body.iter(W + "sectPr"):
+            _ordered_child(sect, "bidi")
+    return {"rtl_paragraphs": rtl}
+
+
 # ------------------------------------------------------------------ facade
-def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, body_rules=None) -> dict:
+def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, body_rules=None,
+                placeholders: Optional[dict] = None) -> dict:
     doc = Document(str(path))
     stats = {"fonts_mapped": normalize_fonts(doc)}
     sanitize(doc)
@@ -685,5 +856,8 @@ def postprocess(path, bands: Optional[layout.Bands] = None, source_pdf=None, bod
         stats["rules_as_borders"] = apply_body_rules(doc, body_rules)
     if bands is not None and source_pdf is not None:
         stats.update({f"{k}_rebuilt": v for k, v in add_header_footer(doc, bands, source_pdf).items()})
+    stats["rtl_lines_restored"] = substitute_placeholders(doc, placeholders or {})
+    normalize_arabic_forms(doc)
+    stats.update(fix_rtl(doc))
     doc.save(str(path))
     return stats

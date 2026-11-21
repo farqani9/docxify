@@ -20,6 +20,7 @@
   // ------------------------------------------------------------------ helpers
   const fmtSize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1048576).toFixed(1)} MB`);
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   let toastTimer;
   function toast(msg) {
     const t = $('toast');
@@ -215,7 +216,7 @@
     const scanned = ready.filter((f) => f.scanned);
     $('convert').disabled = busy || ready.length === 0;
     $('panel-foot').textContent = busy ? 'Uploading…' : ready.length === 0 ? 'Add a PDF to get started.'
-      : `${ready.length} file${ready.length === 1 ? '' : 's'} · ${ready.reduce((n, f) => n + (f.pages || 0), 0)} pages`;
+      : `${ready.length} file${ready.length === 1 ? '' : 's'} · ${plural(ready.reduce((n, f) => n + (f.pages || 0), 0), 'page')}`;
     $('scan-hint').hidden = scanned.length === 0 || state.ocr;
     $('scan-hint-text').textContent = scanned.length === 1 && ready.length === 1
       ? 'This PDF looks scanned. OCR is recommended.'
