@@ -16,6 +16,8 @@
   arabic_pages_scanned.pdf : the same, scanned
 - generic.pdf : English page for clean-up rules: two same-size headings in a row and
                 a numbered list that continues at "3." after a note
+- picture_scanned.pdf : a page with a logo, a photo-like picture holding large text,
+                and text around them, scanned -> OCR must keep the pictures as images
 - light_table_scanned.pdf : a designed page as browsers print it (dark banner with
                 white text, a table with very light borders, a coloured header band
                 with white labels, zebra rows), scanned -> OCR must rebuild the table
@@ -277,6 +279,31 @@ def make_generic(path):
     doc.save(path)
 
 
+PICTURE_TEXT = ["Field report", "The photo below shows the northern station after the April rains.",
+                "Turbidity stayed high for two weeks before returning to normal levels."]
+
+
+def make_picture_page(path):
+    """Logo and a photo-like picture (gradient, shapes, large lettering) among text."""
+    w, h = 900, 420
+    yy, xx = np.mgrid[0:h, 0:w]
+    photo = np.dstack([(60 + 120 * xx / w), (110 + 90 * yy / h), (170 - 60 * xx / w)]).astype(np.uint8)
+    cv2.circle(photo, (650, 210), 120, (40, 70, 160), -1)
+    cv2.rectangle(photo, (80, 260), (420, 380), (230, 200, 120), -1)
+    cv2.putText(photo, "STATION N1", (110, 150), cv2.FONT_HERSHEY_DUPLEX, 2.6, (255, 255, 255), 6)
+    logo = np.full((160, 360, 3), 255, np.uint8)
+    cv2.circle(logo, (80, 80), 60, (180, 120, 30), -1)
+    cv2.putText(logo, "AQUA", (160, 105), cv2.FONT_HERSHEY_TRIPLEX, 2.2, (180, 120, 30), 5)
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(pymupdf.Rect(430, 40, 545, 91), stream=cv2.imencode(".png", logo)[1].tobytes())
+    page.insert_text((50, 130), PICTURE_TEXT[0], fontname="hebo", fontsize=20)
+    page.insert_text((50, 165), PICTURE_TEXT[1], fontname="helv", fontsize=11)
+    page.insert_image(pymupdf.Rect(50, 185, 545, 416), stream=cv2.imencode(".png", photo)[1].tobytes())
+    page.insert_text((50, 445), PICTURE_TEXT[2], fontname="helv", fontsize=11)
+    doc.save(path)
+
+
 LIGHT_TABLE = [["Phase", "Main activities", "Deliverable"],
                ["Analysis", "Workshops and audience study", "Needs report"],
                ["Design", "Scripts and storyboards", "Storyboards"],
@@ -312,11 +339,14 @@ if __name__ == "__main__":
     make_arabic_pages(OUT / "arabic_pages.pdf")
     make_scanned(OUT / "arabic_pages.pdf", OUT / "arabic_pages_scanned.pdf", seed=3)
     make_generic(OUT / "generic.pdf")
+    make_picture_page(OUT / "_picture.pdf")
+    make_scanned(OUT / "_picture.pdf", OUT / "picture_scanned.pdf", seed=9)
+    (OUT / "_picture.pdf").unlink()
     make_light_table(OUT / "_light_table.pdf")
     make_scanned(OUT / "_light_table.pdf", OUT / "light_table_scanned.pdf", seed=5)
     (OUT / "_light_table.pdf").unlink()
     for name in ("digital.pdf", "scanned.pdf", "arabic_shaped.pdf", "arabic_scanned.pdf", "arabic_digital.pdf",
-                 "arabic_pages.pdf", "arabic_pages_scanned.pdf", "generic.pdf", "light_table_scanned.pdf"):
+                 "arabic_pages.pdf", "arabic_pages_scanned.pdf", "generic.pdf", "light_table_scanned.pdf", "picture_scanned.pdf"):
         d = pymupdf.open(OUT / name)
         chars = sum(len(p.get_text().strip()) for p in d)
         print(f"{name}: {d.page_count} pages, {chars} extractable chars, "

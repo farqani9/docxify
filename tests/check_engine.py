@@ -186,6 +186,18 @@ with tempfile.TemporaryDirectory() as tmp:
                                        for p in banner.rows[0].cells[0].paragraphs for r in p.runs)
     ok &= check(shaded and white, "dark banner keeps its fill and white text")
 
+    # ------------------------------------------- scanned page with pictures
+    print("scanned page with pictures + OCR")
+    pc = Path(tmp) / "picture.docx"
+    pstats = engine.convert(FIX / "picture_scanned.pdf", pc, ocr=True)
+    d = docx.Document(str(pc))
+    body_pics = len(d.element.body.findall(".//{*}drawing"))
+    text = "\n".join(p.text for p in d.paragraphs)
+    ok &= check(pstats.get("ocr_pictures", 0) >= 2 and body_pics >= 2, f"logo and photo kept as images ({body_pics})")
+    ok &= check(all(difflib.SequenceMatcher(None, t, text).find_longest_match(0, len(t), 0, len(text)).size >= 0.8 * len(t)
+                    for t in F.PICTURE_TEXT), "text around the pictures still recognised")
+    ok &= check(not re.search(r"STATION\s*N1|AQUA", text.upper()), "lettering inside pictures stays in the pictures")
+
     # ------------------------------------------- clean-up rules on an English page
     print("clean-up rules (English)")
     gen = Path(tmp) / "generic.docx"
