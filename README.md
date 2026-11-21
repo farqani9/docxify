@@ -21,7 +21,8 @@ tables, and a proper header and footer. Files never leave your machine.
 - **Layout-faithful conversion** of text PDFs: fonts, tables, images and spacing.
 - **Built-in OCR** for scanned PDFs (PP-OCRv5 via RapidOCR). It straightens pages, recognizes
   the text, rebuilds tables (very light borders, coloured header rows and banners
-  included) and recovers bullet points. Supported
+  included), keeps pictures and logos as images, rebuilds running headers and footers,
+  and recovers bullet points. Supported
   languages: English, other Latin-script languages, and Arabic *(1.1)*.
 - **Arabic and right-to-left text** *(1.1)*, from scans and from digital PDFs. Paragraphs come out
   right to left in Word, in correct reading order, with numbers and Latin words such as
@@ -172,7 +173,8 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Limitations
 
 - Bold and italic aren't recovered from scans. Headings are still detected, from font size.
-- Images inside scanned pages are dropped in OCR mode, which keeps only text and tables.
+- In OCR mode, pictures (logos, photos, charts) are kept as images, and text inside a
+  picture stays part of it. A picture that touches text closely can absorb a short line.
 - Multi-column scans and handwriting aren't supported yet.
 - Among right-to-left scripts, OCR covers Arabic only. Digital Hebrew, Persian or Urdu PDFs
   get right-to-left paragraphs, but they're less tested.

@@ -161,6 +161,16 @@ class OcrLine:
 
 
 @dataclass
+class Picture:
+    """A picture region of a scan (logo, photo, chart), deskewed px, with its crop."""
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    png: bytes = b""
+
+
+@dataclass
 class Fill:
     """A uniform filled box in the scan (header band, banner), deskewed px."""
     x0: float
@@ -382,6 +392,106 @@ def _detect_fills(gray: np.ndarray) -> list[Fill]:
             continue                  # not uniform: a picture, not a fill
         out.append(Fill(float(x), float(y), float(x + cw), float(y + ch), med))
     return out
+
+
+def _detect_pictures(page: pymupdf.Page, gray: np.ndarray, binary: np.ndarray, lines: list,
+                     rules: list[tuple], fills: list, angle: float) -> list[Picture]:
+    """Picture regions: ink that no text line, rule or fill explains, plus 'text lines'
+    that are really graphics (a logo's stylised letters: boxes far taller than the
+    page's text lines). Nearby pieces form one region, cropped from a colour render."""
+    h, w = gray.shape
+    heights = sorted(ln.y1 - ln.y0 for ln in lines if ln.y1 > ln.y0)
+    if not heights:
+        return []
+    typical = heights[len(heights) // 2]
+
+    def graphic(ln) -> bool:
+        ratio = (ln.y1 - ln.y0) / max(1.0, typical)
+        return ratio > 2.6 or (ln.score < 0.6 and ratio > 1.8)
+
+    ink = (binary > 0).astype(np.uint8)
+    explained = np.zeros_like(ink)
+    for ln in lines:
+        if graphic(ln):
+            continue
+        x0, y0, x1, y1 = ln.det if ln.det else (ln.x0, ln.y0, ln.x1, ln.y1)
+        explained[max(0, int(y0) - 4):int(y1) + 5, max(0, int(x0) - 4):int(x1) + 5] = 1
+    for r in rules:
+        k, x0, y0, x1, y1, t = r[:6]
+        pad = int(t) + 4
+        explained[max(0, int(min(y0, y1)) - pad):int(max(y0, y1)) + pad + 1,
+                  max(0, int(min(x0, x1)) - pad):int(max(x0, x1)) + pad + 1] = 1
+    for f in fills:
+        explained[max(0, int(f.y0) - 3):int(f.y1) + 4, max(0, int(f.x0) - 3):int(f.x1) + 4] = 1
+    rest = ink & (1 - explained)
+    rest = cv2.morphologyEx(rest * 255, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    grown = cv2.dilate(rest, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
+    n, _lab, stats, _ = cv2.connectedComponentsWithStats(grown, connectivity=8)
+    regions = []
+    for i in range(1, n):
+        x, y, cw, ch, _area = stats[i]
+        x0, y0, x1, y1 = x + 10, y + 10, x + cw - 10, y + ch - 10     # undo most of the growth
+        if x1 - x0 < 40 or y1 - y0 < 40 or max(x1 - x0, y1 - y0) > 15 * min(x1 - x0, y1 - y0):
+            continue                      # specks, stray pieces of lines
+        if (rest[y0:y1, x0:x1] > 0).sum() < 0.02 * (x1 - x0) * (y1 - y0):
+            continue
+        regions.append([x0, y0, x1, y1])
+    # a graphic 'text line' touching a region belongs to it
+    for ln in lines:
+        if graphic(ln):
+            for r in regions:
+                if ln.x0 < r[2] + 20 and ln.x1 > r[0] - 20 and ln.y0 < r[3] + 20 and ln.y1 > r[1] - 20:
+                    r[:] = [min(r[0], ln.x0), min(r[1], ln.y0), max(r[2], ln.x1), max(r[3], ln.y1)]
+    # lettering right beside an emblem, on the same band, is part of the logo
+    for ln in lines:
+        lh = max(1.0, ln.y1 - ln.y0)
+        if graphic(ln) or len(ln.text.split()) > 3:
+            continue
+        for r in regions:
+            overlap = min(r[3], ln.y1) - max(r[1], ln.y0)
+            gap = max(r[0] - ln.x1, ln.x0 - r[2])
+            if overlap >= 0.6 * lh and gap <= 0.8 * lh:
+                r[:] = [min(r[0], ln.x0), min(r[1], ln.y0), max(r[2], ln.x1), max(r[3], ln.y1)]
+                break
+    merged = True
+    while merged:                         # overlapping or touching regions are one picture
+        merged = False
+        for i in range(len(regions)):
+            for j in range(i + 1, len(regions)):
+                a, b = regions[i], regions[j]
+                if a[0] < b[2] + 30 and b[0] < a[2] + 30 and a[1] < b[3] + 30 and b[1] < a[3] + 30:
+                    regions[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    del regions[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    if not regions:
+        return []
+    pix = page.get_pixmap(dpi=OCR_DPI, alpha=False)
+    rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3]
+    if angle:
+        mr = cv2.getRotationMatrix2D((pix.width / 2, pix.height / 2), angle, 1.0)
+        rgb = cv2.warpAffine(rgb, mr, (pix.width, pix.height), borderValue=(255, 255, 255))
+    out = []
+    for x0, y0, x1, y1 in regions:
+        x0, y0 = max(0, int(x0) - 4), max(0, int(y0) - 4)
+        x1, y1 = min(w, int(x1) + 4), min(h, int(y1) + 4)
+        ok, png = cv2.imencode(".png", cv2.cvtColor(rgb[y0:y1, x0:x1], cv2.COLOR_RGB2BGR))
+        if ok:
+            out.append(Picture(float(x0), float(y0), float(x1), float(y1), png.tobytes()))
+    return out
+
+
+def _in_picture(ln, pictures: list[Picture]) -> bool:
+    """A text line mostly inside a picture is part of it (a logo's tagline)."""
+    area = max(1.0, (ln.x1 - ln.x0) * (ln.y1 - ln.y0))
+    for p in pictures:
+        ix = max(0.0, min(p.x1, ln.x1) - max(p.x0, ln.x0))
+        iy = max(0.0, min(p.y1, ln.y1) - max(p.y0, ln.y0))
+        if ix * iy >= 0.6 * area:
+            return True
+    return False
 
 
 def _mostly_text(f: "Fill", lines: list) -> bool:
@@ -665,9 +775,9 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
     ln.text = ("\u2022 " + text) if bullet and not text.startswith("\u2022") else text
 
 
-def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list, tuple[int, int], list]:
-    """OCR one page. Returns text lines, table rules and filled boxes (all in deskewed
-    px), and the image size. Rules carry the grey level to redraw them with."""
+def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list, tuple[int, int], list, list]:
+    """OCR one page. Returns text lines, table rules, filled boxes (all in deskewed px),
+    the image size, and picture regions. Rules carry the grey level to redraw them with."""
     gray = _page_gray(page, OCR_DPI)
     h, w = gray.shape
     with _engine_lock:
@@ -717,6 +827,15 @@ def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list,
                                             r[2] - 6 <= ln.y0 and ln.y1 <= r[4] + 6 for r in rules)
             ln.bullet_x = b[0] if b and not on_rule else None   # a dash of a faint border
 
+    # Pictures (logos, photos, charts) are kept as images; text inside them goes with them.
+    pictures = _detect_pictures(page, gray, binary, lines, rules, fills, angle)
+    if pictures:
+        lines = [ln for ln in lines if not _in_picture(ln, pictures)]
+        # strokes of a logo can pass for short rules: inside a picture they are the picture
+        rules = [r for r in rules if not any(p.x0 - 4 <= min(r[1], r[3]) and max(r[1], r[3]) <= p.x1 + 4 and
+                                             p.y0 - 4 <= min(r[2], r[4]) and max(r[2], r[4]) <= p.y1 + 4
+                                             for p in pictures)]
+
     if fills:
         # colour of each fill, from a small colour render turned like the grey image
         pix = page.get_pixmap(dpi=50, alpha=False)
@@ -739,7 +858,7 @@ def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list,
                 lighter = int((crop > f.gray + 30).sum())
                 darker = int((crop < f.gray - 30).sum())
                 ln.light = lighter > darker
-    return lines, rules, (w, h), fills
+    return lines, rules, (w, h), fills, pictures
 
 
 _DESC = set("gjpqy,;()[]{}|/@$")
@@ -836,7 +955,7 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
                 continue
             if progress:
                 progress("ocr", stats["ocr_pages"], len(todo))
-            lines, rules, (w, h), fills = ocr_page(page, lang)
+            lines, rules, (w, h), fills, pictures = ocr_page(page, lang)
             pw, ph = page.rect.width, page.rect.height
             sx, sy = pw / w, ph / h
             _assign_sizes(lines, sx)
@@ -844,6 +963,10 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
             for f in fills:   # coloured header rows and banners, under the text
                 newp.draw_rect(pymupdf.Rect(f.x0 * sx, f.y0 * sy, f.x1 * sx, f.y1 * sy),
                                color=None, fill=f.rgb, width=0)
+            for pic in pictures:
+                newp.insert_image(pymupdf.Rect(pic.x0 * sx, pic.y0 * sy, pic.x1 * sx, pic.y1 * sy),
+                                  stream=pic.png)
+            stats["ocr_pictures"] = stats.get("ocr_pictures", 0) + len(pictures)
             ext = 3.0  # px: extend rules so neighbouring borders actually intersect
             for kind, x0, y0, x1, y1, thick, shade in rules:
                 if kind == "h":
@@ -1386,7 +1509,7 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
         bands = None
         try:
             bands = layout.detect_bands(work, skip_pages=set() if stats["ocr"] else set(info.scanned_pages),
-                                        placeholders=placeholders)
+                                        placeholders=placeholders, fuzzy=stats["ocr"])
         except Exception:
             log.exception("header/footer detection failed; converting without it")
         body_pdf = work

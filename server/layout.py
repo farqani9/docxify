@@ -200,8 +200,41 @@ def _same_box(a: tuple, b: tuple, tol: float = 1.5) -> bool:
     return all(abs(x - y) <= tol for x, y in zip(a, b))
 
 
+def _match_ocr_items(per_page: dict) -> None:
+    """On OCR'd pages a running header differs a little from page to page (recognition
+    noise, a few points of residual skew). Give such near-identical items one key:
+    same kind, about the same place and size, and similar text."""
+    import difflib
+
+    clusters: list[dict] = []
+
+    def text_of(it):
+        return _norm("".join(s.text for s in it.spans)) if it.kind == "text" else ""
+
+    for pno in sorted(per_page):
+        for it in per_page[pno]:
+            t = text_of(it)
+            for c in clusters:
+                a, b = c["bbox"], it.bbox
+                if c["kind"] != it.kind or c["page"] == pno:
+                    continue
+                if abs(a[1] - b[1]) > 8 or abs(a[3] - b[3]) > 8:
+                    continue
+                if abs(a[0] - b[0]) > 15 and abs(a[2] - b[2]) > 15:      # left or right aligned
+                    continue
+                wa, wb = a[2] - a[0], b[2] - b[0]
+                if it.kind != "rule" and abs(wa - wb) > 0.25 * max(wa, wb, 1):
+                    continue
+                if it.kind == "text" and difflib.SequenceMatcher(None, c["text"], t).ratio() < 0.5:
+                    continue
+                it.key = c["key"]
+                break
+            else:
+                clusters.append({"kind": it.kind, "bbox": it.bbox, "text": t, "key": it.key, "page": pno})
+
+
 def detect_bands(path: str | Path, skip_pages: Optional[set] = None,
-                 placeholders: Optional[dict] = None) -> Optional[Bands]:
+                 placeholders: Optional[dict] = None, fuzzy: bool = False) -> Optional[Bands]:
     skip_pages = skip_pages or set()
     with pymupdf.open(path) as doc:
         n = doc.page_count
@@ -218,6 +251,8 @@ def detect_bands(path: str | Path, skip_pages: Optional[set] = None,
         usable = len(per_page)
         if usable < 2:
             return None
+        if fuzzy:
+            _match_ocr_items(per_page)
         counts = Counter()
         for items in per_page.values():
             counts.update({it.key for it in items})
@@ -235,16 +270,22 @@ def detect_bands(path: str | Path, skip_pages: Optional[set] = None,
             rep_bot = [i for i in items if i.key in repeated and i.cy > (1 - BOTTOM_ZONE) * h]
             band_boxes = [i.bbox for i in rep_top + rep_bot]
             others = [o for o in obstacles[pno] if not any(_same_box(o, b) for b in band_boxes)]
+            others_top = others
+            if fuzzy and rep_top:
+                # OCR'd pages: a header line read too differently to match is still part
+                # of the band when it sits within it, not body content above the header
+                band_bottom = max(i.bbox[3] for i in rep_top)
+                others_top = [o for o in others if o[3] > band_bottom + 0.5]
             if rep_top and any(i.kind != "rule" for i in rep_top):
                 # a repeated element below some body content is not part of the header
-                first_body = min((o[1] for o in others if o[1] < TOP_ZONE * h + 40), default=h)
+                first_body = min((o[1] for o in others_top if o[1] < TOP_ZONE * h + 40), default=h)
                 rep_top = [i for i in rep_top if i.bbox[3] <= first_body + 0.5]
             if rep_top and any(i.kind != "rule" for i in rep_top):
                 bottom = max(i.bbox[3] for i in rep_top)
-                nxt = min((o[1] for o in others if o[1] >= bottom - 0.5), default=bottom + 4)
+                nxt = min((o[1] for o in others_top if o[1] >= bottom - 0.5), default=bottom + 4)
                 cut = min(bottom + 1.0, (bottom + nxt) / 2)
-                if not any(o[1] < cut and o[3] > 0.5 for o in others if o[3] <= bottom + 0.5
-                           and not any(_same_box(o, b) for b in band_boxes)):
+                if fuzzy or not any(o[1] < cut and o[3] > 0.5 for o in others if o[3] <= bottom + 0.5
+                                    and not any(_same_box(o, b) for b in band_boxes)):
                     header_cut[pno] = cut
                     tops[pno] = rep_top
             if rep_bot and any(i.kind != "rule" for i in rep_bot):
