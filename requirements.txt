@@ -1,0 +1,11 @@
+# Python 3.12 (uv venv --python 3.12 .venv)
+pymupdf==2.1
+pdf2docx==0.5.13
+python-docx==1.2.0
+rapidocr==3.10.0
+onnxruntime==1.32.0
+opencv-python==5.1.0.95
+numpy==2.5.5
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.34

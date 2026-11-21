@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node (browser end-to-end test)
+node_modules/
+
+# Runtime and scratch output
+data/
+out/
+*.docx
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only notes
+FINDINGS.md
+research/
+
+# Private regression cases: only the README and the template are tracked
+feedback/*
+!feedback/README.md
+!feedback/_template/
+
+# Generated test PDFs (python tests/make_fixtures.py)
+tests/fixtures/

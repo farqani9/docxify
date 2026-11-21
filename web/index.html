@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docxify: PDF to Word</title>
+<meta name="description" content="Convert PDFs, including scanned ones, into editable Word documents. Runs on your own computer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='5' y='2' width='22' height='28' rx='4' fill='%232b5ce6'/%3E%3Cpath d='M11 11h10M11 16h10M11 21h6' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Docxify, start over">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="5" y="2" width="22" height="28" rx="4"/><path d="M11 11h10M11 16h10M11 21h6"/></svg>
+      <span>Docxify</span>
+    </a>
+    <p class="topbar-note">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/></svg>
+      Converted on this computer · deleted after 2 hours
+    </p>
+  </header>
+
+  <main id="main">
+    <!-- 1. Select -->
+    <section class="view view-select is-active" id="view-select" aria-labelledby="h-select">
+      <div class="hero">
+        <h1 id="h-select">PDF to Word</h1>
+        <p class="lede">Turn PDFs into editable Word documents. Scanned PDFs too: built-in OCR recognizes the text.</p>
+        <button class="btn btn-primary btn-xl" id="pick" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-5 5m5-5l5 5M5 20h14"/></svg>
+          Select PDF files
+        </button>
+        <p class="drop-hint">or drop PDFs anywhere on this page</p>
+        <ul class="features">
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM4 10h16M10 10v9"/></svg>Keeps layout, tables and lists</li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V4h3M17 4h3v3M20 17v3h-3M7 20H4v-3M8 12h8"/></svg>OCR for scanned pages</li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11V8a5 5 0 0110 0v3M5 11h14v10H5z"/></svg>Files never leave this machine</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 2. Files + options -->
+    <section class="view view-files" id="view-files" aria-labelledby="h-files">
+      <div class="workspace">
+        <div class="files-area">
+          <div class="files-head">
+            <h2 id="h-files">Your files</h2>
+            <button class="btn btn-ghost" id="restart" type="button">Start over</button>
+          </div>
+          <ul class="file-grid" id="file-grid" aria-live="polite"></ul>
+        </div>
+
+        <aside class="panel" aria-labelledby="h-options">
+          <h2 id="h-options">Conversion options</h2>
+          <div class="scan-hint" id="scan-hint" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4m0 4h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>
+            <span id="scan-hint-text">This PDF looks scanned. OCR is recommended.</span>
+          </div>
+          <fieldset class="choices">
+            <legend class="sr-only">Text recognition</legend>
+            <label class="choice">
+              <input type="radio" name="ocr" value="0" checked>
+              <span class="choice-body">
+                <span class="choice-title">No OCR</span>
+                <span class="choice-text">For PDFs with selectable text. Fastest, keeps the original fonts.</span>
+              </span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="ocr" value="1">
+              <span class="choice-body">
+                <span class="choice-title">OCR <span class="tag">Scans</span></span>
+                <span class="choice-text">For scanned PDFs. Recognizes the text so you can edit it in Word.</span>
+              </span>
+            </label>
+          </fieldset>
+          <label class="field" id="lang-field" hidden>
+            <span>Text language</span>
+            <select id="lang">
+              <option value="en">English</option>
+              <option value="latin">Other Latin-script (French, Spanish, German…)</option>
+            </select>
+          </label>
+          <button class="btn btn-primary btn-block" id="convert" type="button" disabled>
+            Convert to Word
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m0 0l-6-6m6 6l-6 6"/></svg>
+          </button>
+          <p class="panel-foot" id="panel-foot">Add a PDF to get started.</p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- 3. Progress -->
+    <section class="view view-progress" id="view-progress" aria-labelledby="h-progress">
+      <div class="card status-card">
+        <div class="spinner" aria-hidden="true"></div>
+        <h2 id="h-progress">Converting…</h2>
+        <p class="status-line" id="status-line" aria-live="polite">Starting…</p>
+        <div class="bar" role="progressbar" aria-labelledby="h-progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
+          <span id="bar-fill"></span>
+        </div>
+        <p class="muted small">Keep this tab open until the download is ready.</p>
+      </div>
+    </section>
+
+    <!-- 4. Done -->
+    <section class="view view-done" id="view-done" aria-labelledby="h-done">
+      <div class="card done-card">
+        <div class="done-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+        </div>
+        <h2 id="h-done">Your Word document is ready</h2>
+        <a class="btn btn-primary btn-xl" id="download" href="#" download>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m0 0l-5-5m5 5l5-5M5 20h14"/></svg>
+          <span id="download-label">Download Word</span>
+        </a>
+        <dl class="summary" id="summary"></dl>
+        <div class="done-actions">
+          <button class="btn btn-secondary" id="again" type="button">Convert another PDF</button>
+          <button class="btn btn-ghost danger" id="delete-now" type="button">Delete files now</button>
+        </div>
+        <p class="muted small" id="expiry">Files are deleted automatically after 2 hours.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- Scanned PDF prompt -->
+  <div class="modal-backdrop" id="ocr-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ocr-title" aria-describedby="ocr-desc">
+      <svg class="modal-art" viewBox="0 0 120 120" aria-hidden="true">
+        <rect x="26" y="14" width="62" height="84" rx="6" class="art-page"/>
+        <rect x="35" y="26" width="44" height="5" rx="2.5" class="art-line"/>
+        <rect x="35" y="36" width="34" height="5" rx="2.5" class="art-line"/>
+        <rect x="35" y="50" width="19" height="16" rx="3" class="art-img"/>
+        <rect x="58" y="50" width="21" height="16" rx="3" class="art-img"/>
+        <rect x="35" y="72" width="44" height="5" rx="2.5" class="art-line"/>
+        <circle cx="84" cy="80" r="14" class="art-lens"/>
+        <path d="M94 90l12 12" class="art-handle"/>
+        <path d="M78 80h12M84 74v12" class="art-scan"/>
+      </svg>
+      <div>
+        <h2 id="ocr-title">This PDF looks scanned</h2>
+        <p id="ocr-desc">Its pages are pictures of text, so Word can't edit them unless the text is recognized with OCR. Without OCR, each page goes into Word as an image.</p>
+        <p class="modal-q">Apply OCR?</p>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="ocr-no" type="button">Continue without OCR</button>
+          <button class="btn btn-primary" id="ocr-yes" type="button">Apply OCR</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="drop-veil" id="drop-veil" hidden>
+    <div><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-5 5m5-5l5 5M5 20h14"/></svg>Drop PDFs to add them</div>
+  </div>
+  <div class="toast" id="toast" role="alert" hidden></div>
+  <input type="file" id="file-input" accept="application/pdf,.pdf" multiple hidden>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
