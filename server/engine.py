@@ -675,7 +675,8 @@ def _dot_like(crop: np.ndarray, a: int, b: int) -> bool:
     if not len(rows) or not len(cols):
         return False
     ih, iw = rows[-1] - rows[0] + 1, cols[-1] - cols[0] + 1
-    return ih <= 0.5 * crop.shape[0] and 0.6 <= iw / ih <= 1.7
+    # a bullet dot is far smaller than a digit ("6" is about half an Arabic line box)
+    return ih <= 0.35 * crop.shape[0] and 0.6 <= iw / ih <= 1.7
 
 
 def _visual_join(parts: list) -> str:
