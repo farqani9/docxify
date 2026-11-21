@@ -157,6 +157,18 @@ class OcrLine:
     size: float = 0.0         # assigned font size (pt)
     rtl: bool = False         # right-to-left line (text kept in logical order)
     det: tuple = ()           # detector box in the deskewed image (px)
+    light: bool = False       # light text on a dark fill (e.g. a coloured header band)
+
+
+@dataclass
+class Fill:
+    """A uniform filled box in the scan (header band, banner), deskewed px."""
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    gray: float               # median grey level of the fill (0-255)
+    rgb: tuple = (0.5, 0.5, 0.5)
 
 
 def _page_gray(page: pymupdf.Page, dpi: int) -> np.ndarray:
@@ -259,6 +271,222 @@ def _detect_rules(binary: np.ndarray) -> list[tuple[str, float, float, float, fl
     vs = [s for s in segs if s[0] == "v"]
     return [s for s in hs if any(touches(s, v) for v in vs)] + \
            [s for s in vs if any(touches(s, hh) for hh in hs)]
+
+
+def _darkness(gray: np.ndarray) -> np.ndarray:
+    """How much darker each pixel is than the lightest pixel near it: lines and text
+    stand out against paper or a fill, whatever the page tone."""
+    g = cv2.GaussianBlur(gray, (3, 3), 0)
+    return cv2.subtract(cv2.dilate(g, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))), g)
+
+
+def _detect_faint_rules(gray: np.ndarray, dark: np.ndarray) -> list[tuple]:
+    """Long thin lines, including very light borders that a binary threshold loses.
+
+    Pixels a little darker than their surroundings are kept, small gaps (noise) are
+    bridged, and only long runs survive. A run must also have paper a few pixels
+    above and below (left and right for columns): text baselines have letters there."""
+    h, w = gray.shape
+    mask = (dark > 9).astype(np.uint8) * 255
+    out: list[tuple] = []
+    for kind in ("h", "v"):
+        length = max(60, w // 8) if kind == "h" else max(60, h // 14)
+        bridge, run = ((5, 1), (length, 1)) if kind == "h" else ((1, 5), (1, length))
+        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, bridge))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, run))
+        n, _lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for i in range(1, n):
+            x, y, cw, ch, _area = stats[i]
+            if kind == "h":
+                if ch > 10 or cw < length:          # a blurred faint line spreads over rows
+                    continue
+                yc = y + ch // 2
+                line = float(dark[max(0, yc - 1):yc + 2, x:x + cw].mean())
+                above = float(dark[y - 8:y - 3, x:x + cw].mean()) if y >= 8 else 0.0
+                below = float(dark[y + ch + 3:y + ch + 8, x:x + cw].mean()) if y + ch + 8 <= h else 0.0
+                if line - max(above, below) >= 5:
+                    out.append(("h", float(x), y + ch / 2, float(x + cw), y + ch / 2, float(ch)))
+            else:
+                if cw > 10 or ch < length:
+                    continue
+                xc = x + cw // 2
+                line = float(dark[y:y + ch, max(0, xc - 1):xc + 2].mean())
+                left = float(dark[y:y + ch, x - 8:x - 3].mean()) if x >= 8 else 0.0
+                right = float(dark[y:y + ch, x + cw + 3:x + cw + 8].mean()) if x + cw + 8 <= w else 0.0
+                if line - max(left, right) >= 5:
+                    out.append(("v", x + cw / 2, float(y), x + cw / 2, float(y + ch), float(cw)))
+    return out
+
+
+def _merge_rules(segs: list[tuple], tol: float = 4, gap: float = 14) -> list[tuple]:
+    """Join collinear pieces of one line (noise breaks faint lines; both detectors
+    can find the same line)."""
+    out = []
+    for kind in ("h", "v"):
+        key = (lambda s: (round(s[2] / tol), s[1])) if kind == "h" else (lambda s: (round(s[1] / tol), s[2]))
+        cur = None
+        for s in sorted((s for s in segs if s[0] == kind), key=key):
+            pos, a, b = (s[2], s[1], s[3]) if kind == "h" else (s[1], s[2], s[4])
+            if cur and abs(cur[0] - pos) <= tol and a - cur[2] <= gap:
+                cur = (cur[0], cur[1], max(cur[2], b), max(cur[3], s[5]))
+                continue
+            if cur:
+                out.append((kind, *cur))
+            cur = (pos, a, b, s[5])
+        if cur:
+            out.append((kind, *cur))
+    return [("h", a, p, b, p, t) if k == "h" else ("v", p, a, p, b, t) for k, p, a, b, t in out]
+
+
+def _join_in_frames(rules: list[tuple], tol: float = 8) -> list[tuple]:
+    """Pieces of one row border inside a table frame (a faint line can be found only at
+    its ends): when both pieces lie between the same two column lines that span them,
+    they are one border."""
+    hs = sorted([r for r in rules if r[0] == "h"], key=lambda r: (r[2], r[1]))
+    vs = [r for r in rules if r[0] == "v"]
+    out, used = [], set()
+    for i, a in enumerate(hs):
+        if i in used:
+            continue
+        x0, x1, y, t = a[1], a[3], a[2], a[5]
+        for j in range(i + 1, len(hs)):
+            b = hs[j]
+            if j in used or abs(b[2] - y) > tol:
+                continue
+            lo, hi = min(x0, b[1]), max(x1, b[3])
+            frame = [v for v in vs if v[2] - tol <= y <= v[4] + tol]
+            if any(v[1] <= lo + 12 for v in frame) and any(v[1] >= hi - 12 for v in frame):
+                x0, x1, t, y = lo, hi, max(t, b[5]), (y + b[2]) / 2   # residual skew
+                used.add(j)
+        out.append(("h", x0, y, x1, y, t))
+    return out + vs
+
+
+def _detect_fills(gray: np.ndarray) -> list[Fill]:
+    """Uniform boxes clearly darker than the paper: coloured header rows, banners.
+    A 9 px median wipes out text strokes, dark on paper as well as light on a fill."""
+    g = cv2.medianBlur(gray, 9)
+    paper = float(np.percentile(g, 90))
+    base = (g < paper - 18).astype(np.uint8) * 255
+    base = cv2.morphologyEx(base, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    base = cv2.morphologyEx(base, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
+    n, _lab, stats, _ = cv2.connectedComponentsWithStats(base, connectivity=4)
+    out = []
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        if cw < 40 or ch < 20 or area < 0.85 * cw * ch:
+            continue
+        inner = g[y + 2:y + ch - 2, x + 2:x + cw - 2]
+        med = float(np.median(inner))
+        if float((np.abs(inner.astype(int) - med) <= 20).mean()) < 0.6:
+            continue                  # not uniform: a picture, not a fill
+        out.append(Fill(float(x), float(y), float(x + cw), float(y + ch), med))
+    return out
+
+
+def _mostly_text(f: "Fill", lines: list) -> bool:
+    """A 'fill' that lies within a text line is dense bold text, not a coloured box."""
+    area = max(1.0, (f.x1 - f.x0) * (f.y1 - f.y0))
+    covered = 0.0
+    for ln in lines:
+        x0, y0, x1, y1 = ln.det if ln.det else (ln.x0, ln.y0, ln.x1, ln.y1)
+        ix = max(0.0, min(f.x1, x1) - max(f.x0, x0))
+        iy = max(0.0, min(f.y1, y1) - max(f.y0, y0))
+        covered += ix * iy
+    return covered >= 0.5 * area
+
+
+def _rule_shade(dark: np.ndarray, r: tuple) -> float:
+    """Grey level (0 black - 1 white) to redraw a rule with: light borders stay light."""
+    k, x0, y0, x1, y1 = r[:5]
+    if k == "h":
+        yc = int(round(y0))
+        band = dark[max(0, yc - 1):yc + 2, int(x0):int(x1) + 1]
+    else:
+        xc = int(round(x0))
+        band = dark[int(y0):int(y1) + 1, max(0, xc - 1):xc + 2]
+    level = float(np.percentile(band, 75)) if band.size else 120.0
+    return max(0.25, min(0.85, 1.0 - 1.4 * level / 255))
+
+
+def _on_fill_edge(r: tuple, fills: list[Fill], rules: list[tuple], tol: float = 9) -> bool:
+    """A horizontal line along the top or bottom edge of a stand-alone fill (a banner;
+    rounded corners leave one just inside it): the fill itself draws that edge. A fill
+    that is part of a table keeps its edges: they separate its rows."""
+    k, x0, y0, x1, y1 = r[:5]
+    if k != "h":
+        return False
+    for f in fills:
+        if not ((abs(y0 - f.y0) <= tol or abs(y0 - f.y1) <= tol) and x0 >= f.x0 - 8 and x1 <= f.x1 + 8):
+            continue
+        in_table = any(v[0] == "v" and f.x0 - 8 <= v[1] <= f.x1 + 8 and
+                       (abs(v[2] - f.y1) <= 20 or abs(v[4] - f.y0) <= 20 or v[2] <= f.y0 <= v[4])
+                       for v in rules)
+        if not in_table:
+            return True
+    return False
+
+
+def _band_columns(rules: list[tuple], fills: list[Fill]) -> list[tuple]:
+    """A coloured header band on top of a table usually shows no column lines; carry
+    the table's column lines up through it, and give it top and bottom edges (all in
+    the band's colour, so they don't show), so the band becomes the table's header row
+    with the table's cells."""
+    out = []
+    for f in fills:
+        cols = [r for r in rules if r[0] == "v" and f.x0 + 6 < r[1] < f.x1 - 6 and f.y0 - 5 <= r[2] <= f.y1 + 20]
+        for r in cols:
+            out.append(("v", r[1], f.y0, r[1], f.y1, r[5], f.rgb))
+        if cols:
+            for y in (f.y0, f.y1):            # unless a real border is already there
+                if not any(r[0] == "h" and abs(r[2] - y) <= 12 and min(r[3], f.x1) - max(r[1], f.x0) > 0.5 * (f.x1 - f.x0)
+                           for r in rules):
+                    out.append(("h", f.x0, y, f.x1, y, 2.0, f.rgb))
+    return out
+
+
+def _split_at_columns(lines: list["OcrLine"], rules: list[tuple], gray: np.ndarray,
+                      binary: np.ndarray, lang: str) -> list["OcrLine"]:
+    """The detector can read the text of two neighbouring cells as one line. Cut such a
+    line at the column lines it crosses and read each piece on its own."""
+    out = []
+    for ln in lines:
+        x0, y0, x1, y1 = ln.det
+        cy = (ln.y0 + ln.y1) / 2
+        cuts = sorted(r[1] for r in rules if r[0] == "v" and x0 + 6 < r[1] < x1 - 6 and r[2] <= cy <= r[4])
+        if not cuts:
+            out.append(ln)
+            continue
+        edges = [x0] + [int(c) for c in cuts] + [x1]
+        for a, b in zip(edges, edges[1:]):
+            a, b = a + 2, b - 2               # stay clear of the line itself
+            if b - a < 8:
+                continue
+            crop = gray[y0:y1, a:b]
+            if crop.size == 0 or not (binary[y0:y1, a:b] > 0).any():
+                continue
+            text, score = _rec_only(crop, lang)
+            if lang == "ar" and text and not is_rtl(text):
+                te, se = _rec_only(crop, "en")      # Latin/digits in their own cell
+                if se > score:
+                    text, score = te, se
+            if not text or score < OCR_MIN_SCORE:
+                continue
+            part = OcrLine(text, score, *_tighten(binary, a, y0, b, y1))
+            part.det = (a, y0, b, y1)
+            out.append(part)
+    return out
+
+
+def _inside_fill(r: tuple, fills: list[Fill], edge: float = 6) -> bool:
+    """A 'rule' inside a fill, away from its edges, is a stroke of light text on it."""
+    k, x0, y0, x1, y1 = r[:5]
+    for f in fills:
+        if k == "h" and f.x0 - 2 <= x0 and x1 <= f.x1 + 2 and f.y0 + edge < y0 < f.y1 - edge:
+            return True
+        if k == "v" and f.y0 - 2 <= y0 and y1 <= f.y1 + 2 and f.x0 + edge < x0 < f.x1 - edge:
+            return True
+    return False
 
 
 _AR_FONT = None
@@ -437,8 +665,9 @@ def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
     ln.text = ("\u2022 " + text) if bullet and not text.startswith("\u2022") else text
 
 
-def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list, tuple[int, int]]:
-    """OCR one page. Returns text lines, table rules (both in deskewed px) and image size."""
+def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list, tuple[int, int], list]:
+    """OCR one page. Returns text lines, table rules and filled boxes (all in deskewed
+    px), and the image size. Rules carry the grey level to redraw them with."""
     gray = _page_gray(page, OCR_DPI)
     h, w = gray.shape
     with _engine_lock:
@@ -466,6 +695,17 @@ def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list,
         ln = OcrLine(text, score, *_tighten(binary, x0, y0, x1, y1))
         ln.det = (max(0, int(x0)), max(0, int(y0)), min(w, int(x1) + 1), min(h, int(y1) + 1))
         lines.append(ln)
+
+    # Table structure first: text the detector read across a column line belongs to two cells.
+    dark = _darkness(gray)
+    fills = _detect_fills(gray)
+    fills = [f for f in fills if not _mostly_text(f, lines)]
+    rules = _join_in_frames(_merge_rules(_detect_rules(binary) + _detect_faint_rules(gray, dark)))
+    rules = [r[:6] + (_rule_shade(dark, r),) for r in rules
+             if not _inside_fill(r, fills) and not _on_fill_edge(r, fills, rules)]
+    rules += _band_columns(rules, fills)
+    lines = _split_at_columns(lines, rules, gray, binary, lang)
+
     for ln in lines:
         ln.rtl = is_rtl(ln.text)
         if ln.rtl:
@@ -473,9 +713,33 @@ def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list,
                 _refine_rtl_line(gray, ln)
         else:
             b = _find_bullet(binary, ln, lines)
-            ln.bullet_x = b[0] if b else None
+            on_rule = b is not None and any(r[0] == "v" and b[0] - 6 <= r[1] <= b[1] + 6 and
+                                            r[2] - 6 <= ln.y0 and ln.y1 <= r[4] + 6 for r in rules)
+            ln.bullet_x = b[0] if b and not on_rule else None   # a dash of a faint border
 
-    return lines, _detect_rules(binary), (w, h)
+    if fills:
+        # colour of each fill, from a small colour render turned like the grey image
+        pix = page.get_pixmap(dpi=50, alpha=False)
+        rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3]
+        k = pix.width / w
+        if angle:
+            mr = cv2.getRotationMatrix2D((pix.width / 2, pix.height / 2), angle, 1.0)
+            rgb = cv2.warpAffine(rgb, mr, (pix.width, pix.height), borderValue=(255, 255, 255))
+        for f in fills:
+            cx0, cy0 = int(f.x0 * k) + 1, int(f.y0 * k) + 1
+            cx1, cy1 = max(cx0 + 1, int(f.x1 * k) - 1), max(cy0 + 1, int(f.y1 * k) - 1)
+            patch = rgb[cy0:cy1, cx0:cx1].reshape(-1, 3)
+            if len(patch):
+                f.rgb = tuple(float(v) / 255 for v in np.median(patch, axis=0))
+        for ln in lines:      # text lighter than the fill it sits on (white on colour)
+            cx, cy = (ln.x0 + ln.x1) / 2, (ln.y0 + ln.y1) / 2
+            f = next((f for f in fills if f.x0 <= cx <= f.x1 and f.y0 <= cy <= f.y1), None)
+            if f is not None:
+                crop = gray[int(ln.y0):int(ln.y1) + 1, int(ln.x0):int(ln.x1) + 1].astype(int)
+                lighter = int((crop > f.gray + 30).sum())
+                darker = int((crop < f.gray - 30).sum())
+                ln.light = lighter > darker
+    return lines, rules, (w, h), fills
 
 
 _DESC = set("gjpqy,;()[]{}|/@$")
@@ -572,38 +836,45 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
                 continue
             if progress:
                 progress("ocr", stats["ocr_pages"], len(todo))
-            lines, rules, (w, h) = ocr_page(page, lang)
+            lines, rules, (w, h), fills = ocr_page(page, lang)
             pw, ph = page.rect.width, page.rect.height
             sx, sy = pw / w, ph / h
             _assign_sizes(lines, sx)
             newp = out.new_page(width=pw, height=ph)
+            for f in fills:   # coloured header rows and banners, under the text
+                newp.draw_rect(pymupdf.Rect(f.x0 * sx, f.y0 * sy, f.x1 * sx, f.y1 * sy),
+                               color=None, fill=f.rgb, width=0)
             ext = 3.0  # px: extend rules so neighbouring borders actually intersect
-            for kind, x0, y0, x1, y1, thick in rules:
+            for kind, x0, y0, x1, y1, thick, shade in rules:
                 if kind == "h":
                     x0, x1 = x0 - ext, x1 + ext
                 else:
                     y0, y1 = y0 - ext, y1 + ext
+                rgb = shade if isinstance(shade, tuple) else (shade, shade, shade)
                 newp.draw_line((x0 * sx, y0 * sy), (x1 * sx, y1 * sy),
-                               color=(0.45, 0.45, 0.45), width=max(0.5, min(2.0, thick * sx)))
+                               color=rgb, width=max(0.5, min(2.0, thick * sx)))
             for ln in sorted(lines, key=lambda l: (round(l.y0 / 12), l.x0)):
                 bottom = ln.y1 * sy
+                ink = (1, 1, 1) if ln.light else (0, 0, 0)
                 if ln.rtl:
                     token = layout.placeholder(len(placeholders))
                     placeholders[token] = {"text": ln.text, "size": ln.size, "bold": False}
                     stats["ocr_bullets"] += ln.text.startswith("\u2022 ")
                     text, size = layout.fit_token(token, (ln.x1 - ln.x0) * sx, ln.size)
                     newp.insert_text((ln.x0 * sx, bottom - 0.25 * ln.size), text,
-                                     fontname="helv", fontsize=size)
+                                     fontname="helv", fontsize=size, color=ink)
                     continue
                 baseline = bottom - (0.207 * ln.size if _DESC & set(ln.text) else 0)
                 if ln.bullet_x is not None:
                     newp.insert_text((ln.bullet_x * sx, baseline), "•", fontname="helv",
                                      fontsize=ln.size)
                     stats["ocr_bullets"] += 1
-                newp.insert_text((ln.x0 * sx, baseline), ln.text, fontname="helv", fontsize=ln.size)
+                newp.insert_text((ln.x0 * sx, baseline), ln.text, fontname="helv", fontsize=ln.size,
+                                 color=ink)
             stats["ocr_pages"] += 1
             stats["ocr_lines"] += len(lines)
             stats["table_rules"] += len(rules)
+            stats["ocr_fills"] = stats.get("ocr_fills", 0) + len(fills)
         if progress:
             progress("ocr", stats["ocr_pages"], len(todo))
         out.save(dst, garbage=3, deflate=True)
@@ -1143,7 +1414,7 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
 
         _pdf_to_docx(body_pdf, dst, progress)
         try:
-            stats.update(docx_fix.postprocess(dst, bands, work, rules, placeholders))
+            stats.update(docx_fix.postprocess(dst, bands, work, rules, placeholders, ocr=stats["ocr"]))
         except Exception:
             log.exception("docx post-processing failed; keeping raw layout")
 
