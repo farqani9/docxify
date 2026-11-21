@@ -5,29 +5,34 @@
 [![CI](https://github.com/farqani9/docxify/actions/workflows/ci.yml/badge.svg)](https://github.com/farqani9/docxify/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776ab.svg)
-![Release 1.1](https://img.shields.io/badge/release-1.1-informational.svg)
+![Release 1.2](https://img.shields.io/badge/release-1.2-informational.svg)
 
 Docxify is a self-hosted PDF → DOCX converter with built-in OCR. Drop in a PDF and get back
 a Word document you can actually edit: real headings, paragraphs that reflow, bulleted lists,
 tables, and a proper header and footer. Files never leave your machine.
 
-> **Current release: 1.1**, which adds Arabic OCR and right-to-left documents. Features
-> marked *(1.1)* below are new in it. See [Versions](#versions).
+> **Current release: 1.2**, which makes scanned documents come out more like the
+> original: tables with faint borders, coloured header rows and banners, pictures and
+> logos, running headers and footers, plus optional proofreading marks. Features marked
+> *(1.2)* or *(1.1)* below are new in that version. See [Versions](#versions).
 
 ![Docxify: files and conversion options](docs/app-options.png)
 
 ## Features
 
 - **Layout-faithful conversion** of text PDFs: fonts, tables, images and spacing.
-- **Built-in OCR** for scanned PDFs (PP-OCRv5 via RapidOCR). It straightens pages, recognizes
-  the text, rebuilds tables (very light borders, coloured header rows and banners
-  included), keeps pictures and logos as images, rebuilds running headers and footers,
-  and recovers bullet points. Supported
-  languages: English, other Latin-script languages, and Arabic *(1.1)*.
+- **Built-in OCR** for scanned PDFs (PP-OCRv5 via RapidOCR). It straightens pages,
+  recognizes the text and rebuilds the page:
+  - tables, including very light borders, coloured header rows and banners *(1.2)*;
+  - pictures and logos, kept as images *(1.2)*;
+  - running headers and footers, as Word headers and footers *(1.2)*;
+  - bullet points.
+
+  Supported languages: English, other Latin-script languages, and Arabic *(1.1)*.
 - **Arabic and right-to-left text** *(1.1)*, from scans and from digital PDFs. Paragraphs come out
   right to left in Word, in correct reading order, with numbers and Latin words such as
   "pH" kept in place.
-- **Proofreading aid.** Optionally, text the OCR read with low confidence is highlighted
+- **Proofreading aid** *(1.2)*. Optionally, text the OCR read with low confidence is highlighted
   in yellow (whole lines, or single words in Arabic), and the summary says how much.
 - **Automatic scan detection.** Docxify spots image-only pages and offers OCR when it would
   help.
@@ -86,7 +91,8 @@ Roman), so it displays correctly in Word, Pages and LibreOffice.
    extractable text that are covered by images count as scanned.
 2. **OCR (optional, for scanned pages).** Each page is rendered at 200 dpi and deskewed,
    then its text is recognized. Each page is rebuilt as a clean text page: ink-tight line
-   positions, clustered font sizes, recovered bullets and redrawn table rules.
+   positions, clustered font sizes, recovered bullets, redrawn table rules (faint ones
+   included) and coloured fills, with pictures kept as images.
    Right-to-left lines are written as placeholders sized to the original line, so the
    layout step can't reorder their characters.
 3. **Layout conversion.** [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) turns the
@@ -125,7 +131,7 @@ curl -o report.docx localhost:8000/v1/download/$TASK
 |---|---|---|
 | `POST` | `/v1/start` | Creates a task, returning `{task, limits, ocr_languages}` |
 | `POST` | `/v1/upload` | Multipart: `task`, `file`, plus optional `uid`, `name`, `chunk`, `chunks` for chunked uploads. Returns `{server_filename, scanned, pages, scanned_pages, thumbnail}` |
-| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin\|ar` (`ar` from 1.1), `ocr_review=0\|1` (highlight low-confidence OCR text), `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
+| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin\|ar` (`ar` from 1.1), `ocr_review=0\|1` (from 1.2: highlight low-confidence OCR text), `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
 | `GET` | `/v1/task/{task}` | Status and progress `{stage, file, files, done, total, percent}` |
 | `GET` | `/v1/download/{task}` | The `.docx`, or a `.zip` for several files |
 | `GET` | `/v1/thumbnail/{task}/{file}` | First-page preview (PNG) |
@@ -175,6 +181,10 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Limitations
 
 - Bold and italic aren't recovered from scans. Headings are still detected, from font size.
+  Stroke thickness was tried for 1.2, but at typical scan resolutions it doesn't separate
+  bold from regular text reliably, so it isn't used.
+- On scans, table rows can come out taller than in the source, so a document can run a
+  page longer, and a table that continues on the next page isn't joined back into one.
 - In OCR mode, pictures (logos, photos, charts) are kept as images, and text inside a
   picture stays part of it. A picture that touches text closely can absorb a short line.
 - Multi-column scans and handwriting aren't supported yet.
@@ -189,7 +199,38 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Versions
 
-### 1.1 (current release, 2026-11-21)
+### 1.2 (current release, 2026-11-21)
+
+Scanned documents come out more like the original.
+
+New:
+
+- **Tables in scans.** Very light borders are found against the local background, and
+  coloured header rows and banners are redrawn with their colour (white text stays
+  white). A coloured band on top of a table becomes its header row, and text the OCR
+  read across two cells is split between them.
+- **Pictures in scans.** Logos, photos and charts are kept as images instead of being
+  dropped, and lettering inside a picture stays part of it.
+- **Running headers and footers on scans** are found despite small differences between
+  pages, so the logo and header text go into the Word header instead of repeating in the
+  body.
+- **Proofreading marks.** With `ocr_review=1` (or "Highlight words to proofread" in the
+  web app), text the OCR read with low confidence is highlighted in yellow: single words
+  in Arabic, whole lines otherwise. The summary says how much.
+- **Fix:** in Arabic OCR, a leading digit is no longer taken for a bullet.
+
+Upgrading from 1.1: no new dependencies. The API gains the optional `ocr_review` field;
+nothing else changes.
+
+Testing: new scanned test files (a light-bordered table with a banner and a coloured
+header; a page with a logo and a photo) are checked by `tests/check_engine.py`. Digital
+PDFs convert exactly as in 1.1. On a simulated scan of a real five-page Arabic proposal,
+every table comes back with its header row, the logo sits in a real Word header, and
+95% of the words are recognized.
+
+Not in 1.2: bold detection from scans (see [Limitations](#limitations)).
+
+### 1.1 (2026-11-21)
 
 New:
 
