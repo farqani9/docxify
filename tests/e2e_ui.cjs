@@ -81,12 +81,16 @@ const assert = (cond, msg) => { if (!cond) throw new Error('ASSERT: ' + msg); co
   await page.check('input[name=ocr][value="1"]', { force: true });
   await page.selectOption('#lang', 'ar');
   assert((await page.textContent('#lang option[value="ar"]')).includes('العربية'), 'Arabic offered as a text language');
+  assert(await page.isVisible('#review-field'), 'proofreading option shown with OCR');
+  await page.check('#review');
   await page.waitForTimeout(250); // option cards fade to their checked state
   await page.screenshot({ path: path.join(outDir, '6_arabic_options.png') });
   await page.click('#convert');
   await page.waitForSelector('#view-done.is-active', { timeout: 120000 });
   assert(/name="ocr_lang"\r?\n\r?\nar\r?\n/.test(processBody), 'Arabic OCR language sent with the job');
   assert(/1 pages? recognized/.test(await page.textContent('#summary')), 'summary reports OCR on the Arabic page');
+  assert(/name="ocr_review"\r?\n\r?\n1\r?\n/.test(processBody), 'proofreading option sent with the job');
+  assert(/Proofread/.test(await page.textContent('#summary')), 'summary reports the proofreading marks');
   const [dlAr] = await Promise.all([page.waitForEvent('download'), page.click('#download')]);
   const docxAr = path.join(outDir, 'ui_arabic.docx');
   await dlAr.saveAs(docxAr);

@@ -5,7 +5,7 @@ A small task-based HTTP API (the web UI in ``web/`` is its only client):
   POST   /v1/start                     -> {"server", "task"}
   POST   /v1/upload                    chunked (2 MB): {"chunks","chunk"} ... then
                                        {"server_filename","scanned","pages",...}
-  POST   /v1/process                   convert_to=docx, ocr=0|1, ocr_lang=en|latin|ar,
+  POST   /v1/process                   convert_to=docx, ocr=0|1, ocr_lang=en|latin|ar, ocr_review=0|1,
                                        files[i][server_filename], files[i][filename]
   GET    /v1/task/{task}               status + progress (polled by the progress bar)
   GET    /v1/download/{task}           .docx (one file) or .zip (several)
@@ -299,6 +299,7 @@ async def process(request: Request):
         _err(400, "InvalidParams", "Only conversion to DOCX is supported.")
     ocr = str(form.get("ocr", "0")) in ("1", "true")
     lang = str(form.get("ocr_lang", "en"))
+    review = str(form.get("ocr_review", "0")) in ("1", "true")
     out_template = str(form.get("output_filename", "{filename}")) or "{filename}"
     packaged = _safe_stem(str(form.get("packaged_filename", "docxify_converted")))
 
@@ -316,10 +317,11 @@ async def process(request: Request):
 
     from starlette.concurrency import run_in_threadpool
 
-    return await run_in_threadpool(_run_task, t, selected, ocr, lang, out_template, packaged)
+    return await run_in_threadpool(_run_task, t, selected, ocr, lang, out_template, packaged, review)
 
 
-def _run_task(t: Task, selected, ocr: bool, lang: str, out_template: str, packaged: str):
+def _run_task(t: Task, selected, ocr: bool, lang: str, out_template: str, packaged: str,
+              review: bool = False):
     with t.lock:
         if t.status == "TaskProcessing":
             _err(409, "TaskBusy", "This task is already converting.")
@@ -348,7 +350,7 @@ def _run_task(t: Task, selected, ocr: bool, lang: str, out_template: str, packag
                 rec = t.files[sf]
                 stem = _safe_stem(out_template.replace("{filename}", _safe_stem(fname)))
                 dst = t.dir / f"out-{idx}.docx"
-                stats = engine.convert(rec.path, dst, ocr=ocr, lang=lang,
+                stats = engine.convert(rec.path, dst, ocr=ocr, lang=lang, review=review,
                                        progress=progress_for(idx, ocr and bool(rec.scanned_pages)))
                 outputs.append((dst, stem + ".docx"))
                 per_file.append({"filename": fname, **stats})

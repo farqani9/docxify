@@ -27,6 +27,8 @@ tables, and a proper header and footer. Files never leave your machine.
 - **Arabic and right-to-left text** *(1.1)*, from scans and from digital PDFs. Paragraphs come out
   right to left in Word, in correct reading order, with numbers and Latin words such as
   "pH" kept in place.
+- **Proofreading aid.** Optionally, text the OCR read with low confidence is highlighted
+  in yellow (whole lines, or single words in Arabic), and the summary says how much.
 - **Automatic scan detection.** Docxify spots image-only pages and offers OCR when it would
   help.
 - **Word-native output:**
@@ -123,7 +125,7 @@ curl -o report.docx localhost:8000/v1/download/$TASK
 |---|---|---|
 | `POST` | `/v1/start` | Creates a task, returning `{task, limits, ocr_languages}` |
 | `POST` | `/v1/upload` | Multipart: `task`, `file`, plus optional `uid`, `name`, `chunk`, `chunks` for chunked uploads. Returns `{server_filename, scanned, pages, scanned_pages, thumbnail}` |
-| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin\|ar` (`ar` from 1.1), `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
+| `POST` | `/v1/process` | `task`, `ocr=0\|1`, `ocr_lang=en\|latin\|ar` (`ar` from 1.1), `ocr_review=0\|1` (highlight low-confidence OCR text), `output_filename={filename}`, `packaged_filename`, `files[i][server_filename]`, `files[i][filename]` |
 | `GET` | `/v1/task/{task}` | Status and progress `{stage, file, files, done, total, percent}` |
 | `GET` | `/v1/download/{task}` | The `.docx`, or a `.zip` for several files |
 | `GET` | `/v1/thumbnail/{task}/{file}` | First-page preview (PNG) |
