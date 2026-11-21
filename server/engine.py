@@ -46,7 +46,11 @@ SCAN_MAX_CHARS = 25          # a page with fewer extractable characters ...
 SCAN_MIN_IMAGE_COVER = 0.35  # ... and images covering at least this share is "scanned"
 OCR_DPI = 200
 OCR_MIN_SCORE = 0.5
-OCR_LANGS = ("en", "latin")
+OCR_LANGS = ("en", "latin", "ar")
+ARABIC_WIDTH_RATIO = 0.85    # shaped width / unshaped Noto Naskh width (calibrated)
+ARABIC_DET_EM = 1.53         # detector box height of an Arabic line, in em (calibrated)
+ARABIC_GROUP_ASPECT = 6.0    # widest word group (x line height) recognised in one go
+is_rtl = docx_fix.is_rtl
 
 
 class ConversionError(Exception):
@@ -117,19 +121,28 @@ _engines: dict[str, object] = {}
 _engine_lock = threading.Lock()   # guards creation and inference (not thread-safe)
 
 
-def _ocr_engine(lang: str):
+def _ocr_engine(lang: str, rec_only: bool = False):
+    """Cached RapidOCR engine. ``rec_only`` engines recognise pre-cut line images.
+    (They are separate instances: per-call use_det/use_cls flags persist in RapidOCR.)"""
     from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
     if lang not in OCR_LANGS:
         lang = "en"
-    if lang not in _engines:
-        _engines[lang] = RapidOCR(params={
+    key = f"{lang}:rec" if rec_only else lang
+    if key not in _engines:
+        params = {
             "Global.log_level": "error",
-            "Rec.lang_type": LangRec.EN if lang == "en" else LangRec.LATIN,
+            "Rec.lang_type": {"en": LangRec.EN, "latin": LangRec.LATIN, "ar": LangRec.ARABIC}[lang],
             "Rec.ocr_version": OCRVersion.PPOCRV5,
             "Rec.model_type": ModelType.MOBILE,
-        })
-    return _engines[lang]
+        }
+        if lang == "ar" or rec_only:
+            # pages are deskewed already; the 180-degree classifier flips short Arabic words
+            params["Global.use_cls"] = False
+        if rec_only:
+            params["Global.use_det"] = False
+        _engines[key] = RapidOCR(params=params)
+    return _engines[key]
 
 
 @dataclass
@@ -142,6 +155,8 @@ class OcrLine:
     y1: float                 # ink-tight box in the deskewed image (px)
     bullet_x: Optional[float] = None
     size: float = 0.0         # assigned font size (pt)
+    rtl: bool = False         # right-to-left line (text kept in logical order)
+    det: tuple = ()           # detector box in the deskewed image (px)
 
 
 def _page_gray(page: pymupdf.Page, dpi: int) -> np.ndarray:
@@ -184,13 +199,17 @@ def _tighten(binary: np.ndarray, x0: float, y0: float, x1: float, y1: float):
     return ix0 + cols[0], iy0 + rows[0], ix0 + cols[-1] + 1, iy0 + rows[-1] + 1
 
 
-def _find_bullet(binary: np.ndarray, ln: OcrLine, others: list[OcrLine]) -> Optional[float]:
-    """A small round blob just left of a text line is a bullet the recogniser skipped."""
+def _find_bullet(binary: np.ndarray, ln: OcrLine, others: list[OcrLine],
+                 side: str = "left") -> Optional[tuple[float, float]]:
+    """A small round blob just before a text line (left of it, or right of it for
+    right-to-left text) is a bullet the recogniser skipped. Returns its x-range."""
     th = ln.y1 - ln.y0
     if th < 6:
         return None
-    rx0 = int(max(0, ln.x0 - 3.5 * th))
-    rx1 = int(ln.x0 - 2)
+    if side == "left":
+        rx0, rx1 = int(max(0, ln.x0 - 3.5 * th)), int(ln.x0 - 2)
+    else:
+        rx0, rx1 = int(ln.x1 + 2), int(min(binary.shape[1], ln.x1 + 3.5 * th))
     ry0, ry1 = int(ln.y0), int(ln.y1) + 1
     if rx1 - rx0 < 4:
         return None
@@ -207,9 +226,10 @@ def _find_bullet(binary: np.ndarray, ln: OcrLine, others: list[OcrLine]) -> Opti
         if any(o is not ln and o.x0 - 2 <= bx <= o.x1 + 2 and o.y0 - 2 <= ry0 + y <= o.y1 + 2
                for o in others):
             continue
-        if best is None or bx > best:
-            best = bx
-    return float(best) if best is not None else None
+        nearer = best is None or (bx > best[0] if side == "left" else bx < best[0])
+        if nearer:
+            best = (float(bx), float(bx + w))
+    return best
 
 
 def _detect_rules(binary: np.ndarray) -> list[tuple[str, float, float, float, float, float]]:
@@ -241,6 +261,182 @@ def _detect_rules(binary: np.ndarray) -> list[tuple[str, float, float, float, fl
            [s for s in vs if any(touches(s, hh) for hh in hs)]
 
 
+_AR_FONT = None
+
+
+def _arabic_font() -> pymupdf.Font:
+    global _AR_FONT
+    if _AR_FONT is None:
+        _AR_FONT = pymupdf.Font(script=6)    # MuPDF's built-in Noto Naskh Arabic
+    return _AR_FONT
+
+
+_LATIN_OR_DIGIT = re.compile(r"[0-9A-Za-z]")
+_LATIN_TOKEN = re.compile(r"^[0-9A-Za-z.,:;/%()+\-]+$")
+_ARABIC_LETTER = re.compile(r"[\u0600-\u06FF]")
+
+
+def _rec_only(crop: np.ndarray, lang: str) -> tuple[str, float]:
+    """Recognise one pre-cut text image (no detection) with the given language model."""
+    img = cv2.cvtColor(cv2.copyMakeBorder(crop, 4, 4, 6, 6, cv2.BORDER_CONSTANT, value=255),
+                       cv2.COLOR_GRAY2BGR)
+    with _engine_lock:
+        out = _ocr_engine(lang, rec_only=True)(img)
+    text = ((out.txts or [""])[0] or "").strip() if out.txts else ""
+    score = float((out.scores or [0])[0] or 0) if out.scores else 0.0
+    return text, score
+
+
+def _ink_chunks(crop: np.ndarray, gap_ratio: float = 0.25) -> list[tuple[int, int, float]]:
+    """Split a line image at word gaps. Gaps are measured in the middle band only, so
+    ascenders/descenders of neighbouring lines can't bridge them. -> (x0, x1, fill)."""
+    _, bw = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h = bw.shape[0]
+    band = bw[int(0.2 * h):int(0.85 * h)]
+    xs = np.where((band > 0).sum(axis=0) > 0)[0]
+    if not len(xs):
+        return []
+    gap = max(3, int(gap_ratio * h))
+    out, start, prev = [], xs[0], xs[0]
+    for x in list(xs[1:]) + [None]:
+        if x is None or x - prev > gap:
+            piece = band[:, start:prev + 1]
+            rows = np.where((piece > 0).sum(axis=1) > 0)[0]
+            area = max(1, (prev + 1 - start) * (rows[-1] - rows[0] + 1 if len(rows) else 1))
+            out.append((int(start), int(prev + 1), float((piece > 0).sum()) / area))
+            if x is not None:
+                start = x
+        if x is not None:
+            prev = x
+    return out
+
+
+def _rtl_join(parts: list) -> str:
+    """parts = [(x, text, is_ltr)] -> reading order: right to left, except that runs of
+    left-to-right pieces (numbers, Latin) keep their own left-to-right order."""
+    parts = sorted((p for p in parts if p[1]), key=lambda p: -p[0])
+    words, i = [], 0
+    while i < len(parts):
+        if parts[i][2]:
+            j = i
+            while j + 1 < len(parts) and parts[j + 1][2]:
+                j += 1
+            words += [p[1] for p in reversed(parts[i:j + 1])]
+            i = j + 1
+        else:
+            words.append(parts[i][1])
+            i += 1
+    return " ".join(words)
+
+
+def _dot_like(crop: np.ndarray, a: int, b: int) -> bool:
+    """The ink between columns a..b is a small, roughly round blob (a bullet dot)."""
+    _, bw = cv2.threshold(crop[:, a:b], 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    rows = np.where((bw > 0).sum(axis=1) > 0)[0]
+    cols = np.where((bw > 0).sum(axis=0) > 0)[0]
+    if not len(rows) or not len(cols):
+        return False
+    ih, iw = rows[-1] - rows[0] + 1, cols[-1] - cols[0] + 1
+    return ih <= 0.5 * crop.shape[0] and 0.6 <= iw / ih <= 1.7
+
+
+def _visual_join(parts: list) -> str:
+    """Reading-order text from pieces read left to right: Arabic pieces (logical order
+    from the Arabic model) are stored visually, left-to-right pieces as read, and the
+    Unicode bidi algorithm puts neutrals such as the dot of "2." where they belong."""
+    from bidi.algorithm import get_display
+
+    visual = []
+    for _x, text, ltr in sorted((p for p in parts if p[1]), key=lambda p: p[0]):
+        # logical -> visual flips only the right-to-left runs (digits keep their order)
+        visual.append(text if ltr else get_display(text, base_dir="R"))
+    return layout._logical_from_visual(" ".join(visual))
+
+
+_REVERSED_MARKER = re.compile(r"^([.)])\s?([0-9\u0660-\u0669]{1,3})(?=\s)")
+
+
+def _fix_marker(text: str) -> str:
+    """A list number read as ".2" or ")2" at the start of an Arabic line is "2." / "2)"."""
+    return _REVERSED_MARKER.sub(lambda m: m.group(2) + m.group(1), text)
+
+
+def _refine_rtl_line(gray: np.ndarray, ln: "OcrLine") -> None:
+    """Re-read an Arabic line in pieces.
+
+    The Arabic model reads short word groups much better than a whole long line
+    (on long lines it drops letters and word spaces), and it drops digits, Latin and
+    bullet dots altogether. So the line is cut at word gaps: when the English model
+    sees digits/Latin on the line, each word is read with both models and the better
+    fit kept; otherwise word groups of limited width are read with the Arabic model."""
+    x0, y0, x1, y1 = ln.det
+    crop = gray[y0:y1, x0:x1]
+    if crop.size == 0:
+        return
+    h = crop.shape[0]
+    chunks = _ink_chunks(crop)
+    # a small round blob at the right end (reading start) is a bullet; a digit such as
+    # "1" or "١" is as narrow and dense, but much taller than wide
+    bullet = len(chunks) > 1 and (chunks[-1][1] - chunks[-1][0]) <= 0.45 * h and chunks[-1][2] >= 0.55 \
+        and _dot_like(crop, chunks[-1][0], chunks[-1][1])
+    body = chunks[:-1] if bullet else chunks
+    text = ln.text
+    parts: list = []
+    if body and _LATIN_OR_DIGIT.search(_rec_only(crop, "en")[0]):
+        def read(a: int, b: int, depth: int) -> None:
+            c = crop[:, max(0, a - 3):b + 3]
+            ta, sa = _rec_only(c, "ar")
+            te, se = _rec_only(c, "en")
+            token = bool(te) and bool(_LATIN_TOKEN.match(te.replace(" ", "")))
+            # short Arabic words ("في", "من") must not lose to a confident Latin misreading
+            arabic = bool(_ARABIC_LETTER.search(ta)) and sa >= 0.6 and (len(ta) > 2 or sa >= se)
+            if arabic and token and se >= 0.75 and _LATIN_OR_DIGIT.search(te) and depth == 0:
+                # both scripts in one chunk (narrow spaces): split finer and read again
+                sub = _ink_chunks(c, gap_ratio=0.12)
+                if len(sub) > 1:
+                    off = max(0, a - 3)
+                    for sa_, sb_, _f in sub:
+                        read(off + sa_, off + sb_, depth + 1)
+                    return
+            use_en = token and se >= 0.6 and not arabic
+            parts.append((a, te if use_en else ta, use_en))
+
+        for a, b, _fill in body:
+            read(a, b, 0)
+    elif len(body) > 1:
+        # group words right to left up to a set width, so that a gap inside a word
+        # (letters that don't join) rarely becomes a cut
+        group: list = []
+        for c in sorted(body, key=lambda c: -c[0]):
+            if group and group[0][1] - c[0] > ARABIC_GROUP_ASPECT * h:
+                parts.append((group[-1][0], _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")[0], False))
+                group = []
+            group.append(c)
+        if group:
+            parts.append((group[-1][0], _rec_only(crop[:, max(0, group[-1][0] - 3):group[0][1] + 3], "ar")[0], False))
+    if parts:
+        joined = _rtl_join(parts) if not any(p[2] for p in parts) else _visual_join(parts)
+        # never lose Arabic content to the cutting: keep the whole-line reading then
+        if len(_ARABIC_LETTER.findall(joined)) >= 0.85 * len(_ARABIC_LETTER.findall(text)):
+            text = joined
+    text = _fix_marker(text)
+    if chunks and not bullet and (chunks[-1][1] - chunks[-1][0]) <= 1.2 * h:
+        # a list number ("٢.", "3)") read alone: inside a word group it can get lost
+        a, b, _f = chunks[-1]
+        ta, _sa = _rec_only(crop[:, max(0, a - 3):b + 3], "ar")
+        if re.fullmatch(r"[.)]?\s?[0-9\u0660-\u0669]{1,3}\s?[.)]?", ta or "") and re.search(r"[.)]", ta):
+            digits = re.sub(r"[^0-9\u0660-\u0669]", "", ta)
+            closer = ")" if ")" in ta else "."
+            text = f"{digits}{closer} " + re.sub(r"^[\s.)0-9\u0660-\u0669]+", "", text)
+    # A bullet dot glued to the first word is read as "\u0660" (Arabic zero), ":" or "."
+    misread = re.match(r"^[\u0660\u06f0:.\u00b7\u2022]\s*(?=[\u0600-\u06ff])", text)
+    if misread:
+        bullet, text = True, text[misread.end():]
+    elif bullet:
+        text = text.lstrip("\u0660:.\u00b7 ")
+    ln.text = ("\u2022 " + text) if bullet and not text.startswith("\u2022") else text
+
+
 def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list, tuple[int, int]]:
     """OCR one page. Returns text lines, table rules (both in deskewed px) and image size."""
     gray = _page_gray(page, OCR_DPI)
@@ -267,9 +463,17 @@ def ocr_page(page: pymupdf.Page, lang: str = "en") -> tuple[list[OcrLine], list,
         pts = cv2.transform(box.reshape(-1, 1, 2), m).reshape(-1, 2) if angle else box
         x0, y0 = pts.min(axis=0)
         x1, y1 = pts.max(axis=0)
-        lines.append(OcrLine(text, score, *_tighten(binary, x0, y0, x1, y1)))
+        ln = OcrLine(text, score, *_tighten(binary, x0, y0, x1, y1))
+        ln.det = (max(0, int(x0)), max(0, int(y0)), min(w, int(x1) + 1), min(h, int(y1) + 1))
+        lines.append(ln)
     for ln in lines:
-        ln.bullet_x = _find_bullet(binary, ln, lines)
+        ln.rtl = is_rtl(ln.text)
+        if ln.rtl:
+            if lang == "ar":
+                _refine_rtl_line(gray, ln)
+        else:
+            b = _find_bullet(binary, ln, lines)
+            ln.bullet_x = b[0] if b else None
 
     return lines, _detect_rules(binary), (w, h)
 
@@ -281,6 +485,15 @@ def _assign_sizes(lines: list[OcrLine], pt_per_px: float) -> None:
     """Font size per line from ink-tight metrics, then snapped to size clusters."""
     for ln in lines:
         w_pt, h_pt = (ln.x1 - ln.x0) * pt_per_px, (ln.y1 - ln.y0) * pt_per_px
+        if ln.rtl:
+            # Arabic ink height varies a lot with the letters used. Two rougher signals
+            # with independent errors: the text width (Naskh metrics) and the detector
+            # box height; their geometric mean is the steadiest estimate.
+            unit = _arabic_font().text_length(ln.text.replace("\u2022 ", ""), fontsize=1)
+            by_height = ((ln.det[3] - ln.det[1]) * pt_per_px / ARABIC_DET_EM) if ln.det else h_pt / 1.15
+            by_width = w_pt / (unit * ARABIC_WIDTH_RATIO) if unit else by_height
+            ln.size = math.sqrt(by_width * by_height)
+            continue
         unit = pymupdf.get_text_length(ln.text, fontname="helv", fontsize=1)
         by_w = w_pt / unit if unit > 0 else 0
         # glyph extent: cap height 0.718 (+ descender 0.207 when present)
@@ -310,6 +523,20 @@ def _assign_sizes(lines: list[OcrLine], pt_per_px: float) -> None:
         value = expanded[len(expanded) // 2]
         for ln in g:
             ln.size = max(4.0, round(value * 2) / 2)
+    # Short Arabic text gives noisy estimates: when it is near the size of the running
+    # Arabic text, it is that size. Text sharing its row with other text (table cells)
+    # is never a heading, so it is snapped from further away.
+    long_rtl = sorted(l.size for l in lines if l.rtl and len(l.text) >= 20 for _ in range(len(l.text)))
+    if long_rtl:
+        body = long_rtl[len(long_rtl) // 2]
+        for ln in lines:
+            if not ln.rtl:
+                continue
+            cy, half = (ln.y0 + ln.y1) / 2, (ln.y1 - ln.y0) / 2
+            in_row = any(o is not ln and abs((o.y0 + o.y1) / 2 - cy) <= half for o in lines)
+            off = abs(ln.size / body - 1)
+            if (in_row and off < 0.25) or (len(ln.text) < 12 and off < 0.15):
+                ln.size = body
     # Very short strings ("pH", "7.1") give unreliable estimates: take the size of
     # longer text on the same row (typically the other cells of a table row).
     for ln in lines:
@@ -322,10 +549,20 @@ def _assign_sizes(lines: list[OcrLine], pt_per_px: float) -> None:
             ln.size = sorted(mates)[len(mates) // 2]
 
 
+PLACEHOLDER = docx_fix.PLACEHOLDER
+
+
 def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], lang: str,
-                  progress: Optional[Progress] = None) -> dict:
-    """Write a copy of ``src`` where every scanned page is replaced by a text page."""
+                  progress: Optional[Progress] = None) -> tuple[dict, dict]:
+    """Write a copy of ``src`` where every scanned page is replaced by a text page.
+
+    Right-to-left lines are written as placeholder tokens stretched over their box:
+    the layout converter then places them (paragraphs, table cells) without the
+    bidi reordering that mangles RTL text, and ``docx_fix`` swaps each token for the
+    OCR text, which is already in logical order. Returns (stats, placeholders) where
+    placeholders maps token -> {"text", "size", "bold"}."""
     stats = {"ocr_pages": 0, "ocr_lines": 0, "ocr_bullets": 0, "table_rules": 0}
+    placeholders: dict[str, str] = {}
     todo = set(scanned_pages)
     with pymupdf.open(src) as doc, pymupdf.open() as out:
         for idx in range(doc.page_count):
@@ -350,6 +587,14 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
                                color=(0.45, 0.45, 0.45), width=max(0.5, min(2.0, thick * sx)))
             for ln in sorted(lines, key=lambda l: (round(l.y0 / 12), l.x0)):
                 bottom = ln.y1 * sy
+                if ln.rtl:
+                    token = layout.placeholder(len(placeholders))
+                    placeholders[token] = {"text": ln.text, "size": ln.size, "bold": False}
+                    stats["ocr_bullets"] += ln.text.startswith("\u2022 ")
+                    text, size = layout.fit_token(token, (ln.x1 - ln.x0) * sx, ln.size)
+                    newp.insert_text((ln.x0 * sx, bottom - 0.25 * ln.size), text,
+                                     fontname="helv", fontsize=size)
+                    continue
                 baseline = bottom - (0.207 * ln.size if _DESC & set(ln.text) else 0)
                 if ln.bullet_x is not None:
                     newp.insert_text((ln.bullet_x * sx, baseline), "•", fontname="helv",
@@ -362,7 +607,7 @@ def build_ocr_pdf(src: str | Path, dst: str | Path, scanned_pages: list[int], la
         if progress:
             progress("ocr", stats["ocr_pages"], len(todo))
         out.save(dst, garbage=3, deflate=True)
-    return stats
+    return stats, placeholders
 
 
 # ------------------------------------------------------------------- pdf2docx
@@ -552,9 +797,13 @@ def _reflow(doc, default_size: float) -> int:
         if not lines:
             continue
         full: dict[float, int] = {}
+        count: Counter = Counter()
         for ln in lines:
             n = len(ln.text.strip())
             full[ln.size] = max(full.get(ln.size, 0), n)
+            count[ln.size] += 1
+        # rough line widths, for sizes too rare to have their own longest line
+        widest = max(len(ln.text.strip()) * ln.size for ln in lines)
 
         def joins(prev: _Line, cur_: _Line) -> bool:
             pt, ct = prev.text.strip(), cur_.text.strip()
@@ -565,9 +814,12 @@ def _reflow(doc, default_size: float) -> int:
             if cur_.first_in_para and (cur_.gap_before > max(3.0, 0.35 * cur_.size)
                                        or abs(cur_.indent - prev.indent) > 6):
                 return False
-            longest = max(1, full.get(prev.size, len(pt)))
-            prev_full = len(pt) >= 0.72 * longest
-            if pt[-1] in ".!?:" and not prev_full:
+            if count[prev.size] >= 3:
+                longest = max(1, full.get(prev.size, len(pt)))
+                prev_full = len(pt) >= 0.72 * longest
+            else:   # e.g. OCR'd English lines in an Arabic scan: compare with the whole group
+                prev_full = len(pt) * prev.size >= 0.72 * widest
+            if pt[-1] in ".!?:\u061f" and not prev_full:   # incl. Arabic question mark
                 return False
             return prev_full
 
@@ -612,6 +864,58 @@ def _reflow(doc, default_size: float) -> int:
 
 def _run_size(run, default: float) -> float:
     return run.font.size.pt if run.font.size else default
+
+
+def _restart_numbering(doc, groups: list) -> None:
+    """Each numbered list counts from the number its source starts with ("1." for a new
+    list, "3." for one that continues after a note): its own numbering instance."""
+    if not groups or (len(groups) == 1 and groups[0][0] == 1):
+        return
+    try:
+        numbering = doc.part.numbering_part.element
+        style_num = doc.styles["List Number"].element.pPr.numPr.numId.val
+        abstract = next(n.abstractNumId.val for n in numbering.num_lst if n.numId == style_num)
+    except Exception:
+        return
+    for k, (start, group) in enumerate(groups):
+        if k == 0 and start == 1:
+            continue                       # the list style already counts from 1
+        num = numbering.add_num(abstract)
+        num.add_lvlOverride(ilvl=0).add_startOverride(start)
+        for p in group:
+            numpr = p._p.get_or_add_pPr().get_or_add_numPr()
+            numpr.get_or_add_ilvl().val = 0
+            numpr.get_or_add_numId().val = num.numId
+
+
+def _tighten_lists(doc) -> None:
+    """Items of one list sit at the source line pitch. When the converter's line
+    spacing already spans that pitch (seen with right-to-left lines), the before/after
+    gap it adds to every item comes on top of it, so the gaps between items go."""
+    from docx.shared import Pt
+
+    paras = doc.paragraphs
+    k = 0
+    while k < len(paras):
+        if not paras[k].style.name.startswith("List"):
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(paras) and paras[j + 1].style.name.startswith("List") \
+                and paras[j]._p.getnext() is paras[j + 1]._p:
+            j += 1
+        for i in range(k, j + 1):
+            pf = paras[i].paragraph_format
+            ls = pf.line_spacing
+            size = max((r.font.size.pt for r in paras[i].runs if r.font.size), default=11.0)
+            # only when the line spacing already spans a whole source line pitch
+            if not (hasattr(ls, "pt") and ls.pt >= 1.6 * size):
+                continue
+            if i > k and (pf.space_before or 0) > 0:
+                pf.space_before = Pt(0)
+            if i < j and (pf.space_after or 0) > 0:
+                pf.space_after = Pt(0)
+        k = j + 1
 
 
 def enrich_docx(path: str | Path, title: str = "") -> dict:
@@ -660,16 +964,54 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
         runs = [r for r in p.runs if r.text.strip()]
         if not runs or len(text) > 120 or len(text.split()) > 14:
             continue
-        if text.endswith((".", ",", ";")) and len(text.split()) > 6:
+        if text.endswith((".", ",", ";", "\u060c", "\u061b")) and len(text.split()) > 6:
             continue
         size = max(_run_size(r, default_size) for r in runs)
         bold = all(r.bold for r in runs)
-        if size >= body * 1.25 or (bold and size >= body * 1.08):
-            candidates.append((p, round(size * 2) / 2))
-    levels = {s: i + 1 for i, s in enumerate(sorted({s for _, s in candidates}, reverse=True)[:3])}
+        # Arabic sizes from scans are estimates (about +-7%) and carry no weight info,
+        # so right-to-left lines get a lower bar and size levels within 12% are merged.
+        rtl = is_rtl(text)
+        title_like = rtl and len(text.split()) <= 8 and not text.endswith((".", ":", "\u060c", "\u061b"))
+        if size >= body * (1.08 if title_like else 1.25) or (bold and size >= body * 1.08):
+            candidates.append((p, round(size * 2) / 2, rtl))
+    rtl_sizes = {s for _, s, rtl in candidates if rtl}
+    levels: dict = {}
+    level_top: dict = {}
+    level, top = 0, None
+    for s in sorted({s for _, s, _ in candidates}, reverse=True):
+        if top is None or s < top / (1.12 if s in rtl_sizes else 1.0) - 1e-6:
+            level, top = level + 1, s
+            level_top[level] = s
+        if level <= 3:
+            levels[s] = level
     headings = 0
-    for p, size in candidates:
+    # A long heading wrapped onto a second line comes out as two paragraphs.
+    for p, size, rtl in list(candidates):
+        nxt = p._p.getnext()
+        mate = next((c for c in candidates if c[0]._p is nxt), None)
+        if mate is None or mate[1] != size or mate[0] is p:
+            continue
+        first, second = p.text.strip(), mate[0].text.strip()
+        gap = mate[0].paragraph_format.space_before
+        close = (gap.pt if gap is not None else 0.0) <= 0.6 * size
+        # right-to-left only: there pdf2docx leaves a wrapped title line as its own paragraph
+        if rtl and mate[2] and close and len(first.split()) >= 5 and len(second) <= len(first) \
+                and not first.endswith((".", ":", "\u061f", "?", "!")) \
+                and not _NUMBER.match(second) and not _BULLET.match(second):
+            moved = list(mate[0]._p.iter(W + "r"))
+            ts = [t for r in moved for t in r.iter(W + "t")]
+            if ts and not p.text.endswith((" ", "\u00a0")) and not (ts[0].text or "").startswith(" "):
+                ts[0].text = " " + (ts[0].text or "")          # the line break was a space
+                ts[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            for r in moved:
+                p._p.append(r)
+            mate[0]._p.getparent().remove(mate[0]._p)
+            candidates.remove(mate)
+    for p, size, rtl in candidates:
         if size in levels:
+            if rtl and size != level_top[levels[size]]:
+                for r in p.runs:            # one estimated size per merged level
+                    r.font.size = Pt(level_top[levels[size]])
             freeze_look(p, keep_style_bold=True)
             p.style = doc.styles[f"Heading {levels[size]}"]
             nxt = p._p.getnext()
@@ -692,15 +1034,23 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
 
     list_items = 0
     numbered_run: list = []
+    numbered_groups: list = []          # (first number in the source, paragraphs)
+
+    def marker_value(p):
+        m = _NUMBER.match(p.text)
+        token = m.group(1) if m else ""
+        return int(token) if token.isdigit() else None
 
     def flush_numbered():
         nonlocal list_items
         if len(numbered_run) >= 2:
+            start = marker_value(numbered_run[0])
             for q in numbered_run:
                 freeze_look(q)
                 strip_marker(q, _NUMBER)
                 q.style = doc.styles["List Number"]
                 list_items += 1
+            numbered_groups.append((start or 1, list(numbered_run)))
         numbered_run.clear()
 
     for p in paras:
@@ -717,10 +1067,16 @@ def enrich_docx(path: str | Path, title: str = "") -> dict:
                 p.paragraph_format.first_line_indent = None
             list_items += 1
         elif _NUMBER.match(p.text):
+            v, last = marker_value(p), marker_value(numbered_run[-1]) if numbered_run else None
+            if numbered_run and v is not None and last is not None and v != last + 1:
+                flush_numbered()           # "1. 2. 3." then "1. 2.": two lists
             numbered_run.append(p)
         else:
             flush_numbered()
     flush_numbered()
+    _restart_numbering(doc, numbered_groups)
+    _tighten_lists(doc)
+    docx_fix.sort_properties(doc)
 
     if not title:
         first = next((p for p in doc.paragraphs if p.style.name == "Heading 1"), None)
@@ -746,17 +1102,20 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
         raise ConversionError("This PDF has no pages.")
     stats: dict = {"pages": info.pages, "scanned_pages": info.scanned_pages, "ocr": False}
 
+    placeholders: dict = {}
     with tempfile.TemporaryDirectory(prefix="docxify-") as tmp:
         work = Path(src)
         if ocr and info.scanned_pages:
             work = Path(tmp) / "ocr.pdf"
-            stats.update(build_ocr_pdf(src, work, info.scanned_pages, lang, progress))
+            ocr_stats, placeholders = build_ocr_pdf(src, work, info.scanned_pages, lang, progress)
+            stats.update(ocr_stats)
             stats["ocr"] = True
 
         # Running header/footer -> real Word header/footer (removed from the body first).
         bands = None
         try:
-            bands = layout.detect_bands(work, skip_pages=set() if stats["ocr"] else set(info.scanned_pages))
+            bands = layout.detect_bands(work, skip_pages=set() if stats["ocr"] else set(info.scanned_pages),
+                                        placeholders=placeholders)
         except Exception:
             log.exception("header/footer detection failed; converting without it")
         body_pdf = work
@@ -771,9 +1130,20 @@ def convert(src: str | Path, dst: str | Path, ocr: bool = False, lang: str = "en
         except Exception:
             log.exception("rule detection failed")
 
+        # Right-to-left lines of text pages -> placeholders (see layout.rewrite_rtl_lines)
+        try:
+            rtl_pdf = Path(tmp) / "rtl.pdf"
+            rtl_map = layout.rewrite_rtl_lines(body_pdf, rtl_pdf, start=len(placeholders),
+                                               skip_pages=set(info.scanned_pages) if stats["ocr"] else set())
+            if rtl_map:
+                placeholders.update(rtl_map)
+                body_pdf = rtl_pdf
+        except Exception:
+            log.exception("right-to-left rewrite failed; converting as is")
+
         _pdf_to_docx(body_pdf, dst, progress)
         try:
-            stats.update(docx_fix.postprocess(dst, bands, work, rules))
+            stats.update(docx_fix.postprocess(dst, bands, work, rules, placeholders))
         except Exception:
             log.exception("docx post-processing failed; keeping raw layout")
 
